@@ -13,10 +13,10 @@ const {
 } = process.env;
 
 if (!LINE_CHANNEL_ACCESS_TOKEN || !LINE_CHANNEL_SECRET) {
-  console.error('缺少 LINE 環境變數'); process.exit(1);
+  console.error('缺少 LINE 環境變數');
 }
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.error('缺少 Supabase 環境變數 (URL / SERVICE_ROLE_KEY)'); process.exit(1);
+  console.error('缺少 Supabase 環境變數 (URL / SERVICE_ROLE_KEY)');
 }
 
 const app = express();
@@ -73,48 +73,87 @@ function parseCommand(text) {
   return null;
 }
 
-async function getUserGroup(userId) {
+// 取得使用者群組與角色（若查不到，回預設群組與 user 角色）
+async function getUserGroupAndRole(userId) {
   const { data, error } = await supabase
-    .from('users').select('群組').eq('user_id', userId).maybeSingle();
+    .from('users')
+    .select('群組, 角色, 黑名單')
+    .eq('user_id', userId)
+    .maybeSingle();
   if (error) throw error;
-  return data?.['群組'] || DEFAULT_GROUP;
+  const group = data?.['群組'] || DEFAULT_GROUP;
+  const role = data?.['角色'] || 'user';
+  const blocked = !!data?.['黑名單'];
+  return { group, role, blocked };
 }
 
-// —— 查詢（依規則）——
-async function searchByName(keyword) {
+// 取「有庫存」的 SKU Set（群組內：庫存箱數>0 或 庫存散數>0）
+async function getInStockSkuSet(group) {
+  const { data, error } = await supabase
+    .from('inventory')
+    .select('貨品編號, 庫存箱數, 庫存散數')
+    .eq('群組', group);
+  if (error) throw error;
+  const set = new Set();
+  (data || []).forEach(row => {
+    const box = Number(row['庫存箱數'] || 0);
+    const piece = Number(row['庫存散數'] || 0);
+    if (box > 0 || piece > 0) set.add(row['貨品編號']);
+  });
+  return set;
+}
+
+// —— 查詢（依你的規則）——
+async function searchByName(keyword, role, group, inStockSet) {
   const { data, error } = await supabase
     .from('products')
     .select('貨品名稱, 貨品編號, 條碼')
     .ilike('貨品名稱', `%${keyword}%`)
-    .limit(10);
+    .limit(20);
   if (error) throw error;
-  return data || [];
+  let list = data || [];
+  if (role === 'user') {
+    list = list.filter(p => inStockSet.has(p['貨品編號']));
+  }
+  return list.slice(0, 10);
 }
-async function searchByBarcode(barcode) {
+
+async function searchByBarcode(barcode, role, group, inStockSet) {
   const { data, error } = await supabase
     .from('products')
     .select('貨品名稱, 貨品編號, 條碼')
     .eq('條碼', barcode.trim())
     .maybeSingle();
   if (error) throw error;
-  return data ? [data] : [];
+  if (!data) return [];
+  if (role === 'user' && !inStockSet.has(data['貨品編號'])) return [];
+  return [data];
 }
-async function searchBySku(sku) {
+
+async function searchBySku(sku, role, group, inStockSet) {
+  // 精準
   const { data: exact, error: e1 } = await supabase
     .from('products')
     .select('貨品名稱, 貨品編號, 條碼')
     .eq('貨品編號', sku.trim())
     .maybeSingle();
   if (e1) throw e1;
-  if (exact) return [exact];
+  if (exact && (role !== 'user' || inStockSet.has(exact['貨品編號']))) {
+    return [exact];
+  }
 
+  // 模糊
   const { data: like, error: e2 } = await supabase
     .from('products')
     .select('貨品名稱, 貨品編號, 條碼')
     .ilike('貨品編號', `%${sku}%`)
-    .limit(10);
+    .limit(20);
   if (e2) throw e2;
-  return like || [];
+  let list = like || [];
+  if (role === 'user') {
+    list = list.filter(p => inStockSet.has(p['貨品編號']));
+  }
+  return list.slice(0, 10);
 }
 
 // —— 庫存 —— 
@@ -193,6 +232,7 @@ function buildQuickReplyForProducts(products) {
 
 // —— 路由 —— 
 app.get('/health', (_req, res) => res.status(200).send('OK'));
+app.get('/', (_req, res) => res.status(200).send('RUNNING'));
 
 app.post('/webhook', async (req, res) => {
   try {
@@ -219,11 +259,15 @@ async function handleEvent(event) {
   const replyText = (textStr) => reply({ type: 'text', text: textStr });
 
   const lineUserId = event.source?.userId || 'unknown';
-  const group = await getUserGroup(lineUserId);
+  const { group, role, blocked } = await getUserGroupAndRole(lineUserId);
+  if (blocked) return; // 黑名單直接忽略
+
+  // 預先取得 in-stock set（給 user 過濾）
+  const inStockSet = role === 'user' ? await getInStockSkuSet(group) : null;
 
   // 「查」名稱
   if (parsed.type === 'query') {
-    const list = await searchByName(parsed.keyword);
+    const list = await searchByName(parsed.keyword, role, group, inStockSet || new Set());
     if (!list.length) return replyText('查無此商品');
 
     if (list.length > 1) {
@@ -243,7 +287,7 @@ async function handleEvent(event) {
 
   // 「條碼」
   if (parsed.type === 'barcode') {
-    const list = await searchByBarcode(parsed.barcode);
+    const list = await searchByBarcode(parsed.barcode, role, group, inStockSet || new Set());
     if (!list.length) return replyText('查無此條碼商品');
     const p = list[0];
     const sku = p['貨品編號'];
@@ -254,7 +298,7 @@ async function handleEvent(event) {
 
   // 「編號」
   if (parsed.type === 'sku') {
-    const list = await searchBySku(parsed.sku);
+    const list = await searchBySku(parsed.sku, role, group, inStockSet || new Set());
     if (!list.length) return replyText('查無此貨品編號');
 
     if (list.length > 1) {
@@ -284,8 +328,14 @@ async function handleEvent(event) {
 
     try {
       const r = await changeInventoryByGroupSku(group, sku, deltaBox, deltaPiece, lineUserId, 'LINE');
-      const nb = (r && typeof r.new_box === 'number') ? r.new_box : (await getStockByGroupSku(group, sku)).box;
-      const np = (r && typeof r.new_piece === 'number') ? r.new_piece : (await getStockByGroupSku(group, sku)).piece;
+      // 防止回傳為 null/array 未取到值
+      let nb = null, np = null;
+      if (r && typeof r.new_box === 'number') nb = r.new_box;
+      if (r && typeof r.new_piece === 'number') np = r.new_piece;
+      if (nb === null || np === null) {
+        const s = await getStockByGroupSku(group, sku);
+        nb = s.box; np = s.piece;
+      }
       const sign = (n) => (n >= 0 ? `+${n}` : `${n}`);
       return replyText(`貨品編號：${sku}\n變動：箱 ${sign(deltaBox)}、件 ${sign(deltaPiece)}\n目前庫存：箱 ${nb}、件 ${np}`);
     } catch (err) {
