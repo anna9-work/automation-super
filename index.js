@@ -9,7 +9,7 @@ const {
   LINE_CHANNEL_SECRET,
   SUPABASE_URL,
   SUPABASE_SERVICE_ROLE_KEY,
-  DEFAULT_GROUP = 'default' // 若 users 找不到群組時使用
+  DEFAULT_GROUP = 'default' // users 找不到群組時使用
 } = process.env;
 
 if (!LINE_CHANNEL_ACCESS_TOKEN || !LINE_CHANNEL_SECRET) {
@@ -29,30 +29,26 @@ const client = new line.Client({
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-/** 解析指令：支援
- *  查 可樂 / 查可樂 / 查詢 可樂
- *  條碼 12345 / 條碼12345 / 條碼：12345
- *  編號 123 / 編號123 / 編號：123 / #123
- *  入庫3箱2件 / 入3箱 / 出2件 ...
+/** 指令解析
+ *  查 可樂 / 查可樂 / 查詢 可樂     => { type:'query', keyword }
+ *  條碼 123 / 條碼123 / 條碼：123   => { type:'barcode', barcode }
+ *  編號 ABC / 編號ABC / 編號：ABC / #ABC => { type:'sku', sku }
+ *  入庫3箱2件 / 入3箱 / 出2件       => { type:'change', action, box, piece }
  */
 function parseCommand(text) {
   const t = (text || '').trim();
 
-  // 條碼：允許「條碼 123」、「條碼123」、「條碼：123」
   const mBarcode = t.match(/^條碼[:：]?\s*(.+)$/);
   if (mBarcode) return { type: 'barcode', barcode: mBarcode[1].trim() };
 
-  // 編號(= 貨品編號)：允許「編號 123」、「編號123」、「編號：123」、「#123」
-  const mSku1 = t.match(/^編號[:：#]?\s*(.+)$/);
-  if (mSku1) return { type: 'sku', sku: mSku1[1].trim() };
-  const mSku2 = t.match(/^#\s*(.+)$/);
-  if (mSku2) return { type: 'sku', sku: mSku2[1].trim() };
+  const mSkuHash = t.match(/^#\s*(.+)$/);
+  if (mSkuHash) return { type: 'sku', sku: mSkuHash[1].trim() };
+  const mSku = t.match(/^編號[:：]?\s*(.+)$/);
+  if (mSku) return { type: 'sku', sku: mSku[1].trim() };
 
-  // 查詢：允許「查 可樂」、「查可樂」、「查詢 可樂」
   const mQuery = t.match(/^查(?:詢)?\s*(.+)$/);
   if (mQuery) return { type: 'query', keyword: mQuery[1].trim() };
 
-  // 出入庫：入庫3箱2件 / 入3箱 / 出2件 / 出庫1箱
   const mChange = t.match(/^(入庫|入|出庫|出)\s*(?:(\d+)\s*箱)?\s*(?:(\d+)\s*件)?$/);
   if (mChange) {
     return {
@@ -62,7 +58,6 @@ function parseCommand(text) {
       piece: mChange[3] ? parseInt(mChange[3], 10) : 0
     };
   }
-
   return null;
 }
 
@@ -73,57 +68,50 @@ async function getUserGroup(userId) {
   return data?.['群組'] || DEFAULT_GROUP;
 }
 
-// 查商品：先條碼精準、再貨品編號精準、再名稱/貨品編號模糊（最多 5 筆）
-async function findProductsByKeyword(keyword) {
-  // 條碼精準
-  const { data: byBarcode, error: e1 } = await supabase
+// —— 查詢實作（照你的規則分開處理）——
+
+// 「查」：只用 貨品名稱 模糊
+async function searchByName(keyword) {
+  const { data, error } = await supabase
     .from('products')
-    .select('貨品名稱, 條碼, 貨品編號')
-    .eq('條碼', keyword)
+    .select('貨品名稱, 貨品編號, 條碼')
+    .ilike('貨品名稱', `%${keyword}%`)
+    .limit(5);
+  if (error) throw error;
+  return data || [];
+}
+
+// 「條碼」：只用 條碼 精準
+async function searchByBarcode(barcode) {
+  const { data, error } = await supabase
+    .from('products')
+    .select('貨品名稱, 貨品編號, 條碼')
+    .eq('條碼', barcode.trim())
+    .maybeSingle();
+  if (error) throw error;
+  return data ? [data] : [];
+}
+
+// 「編號」：先 貨品編號 精準，否則再 貨品編號 模糊
+async function searchBySku(sku) {
+  const { data: exact, error: e1 } = await supabase
+    .from('products')
+    .select('貨品名稱, 貨品編號, 條碼')
+    .eq('貨品編號', sku.trim())
     .maybeSingle();
   if (e1) throw e1;
-  if (byBarcode) return [byBarcode];
+  if (exact) return [exact];
 
-  // 貨品編號精準
-  const { data: bySku, error: e2 } = await supabase
+  const { data: like, error: e2 } = await supabase
     .from('products')
-    .select('貨品名稱, 條碼, 貨品編號')
-    .eq('貨品編號', keyword)
-    .maybeSingle();
-  if (e2) throw e2;
-  if (bySku) return [bySku];
-
-  // 名稱/貨品編號 模糊（最多 5）
-  const { data: byLike, error: e3 } = await supabase
-    .from('products')
-    .select('貨品名稱, 條碼, 貨品編號')
-    .or(`貨品名稱.ilike.%${keyword}%,貨品編號.ilike.%${keyword}%`)
+    .select('貨品名稱, 貨品編號, 條碼')
+    .ilike('貨品編號', `%${sku}%`)
     .limit(5);
-  if (e3) throw e3;
-  return byLike || [];
+  if (e2) throw e2;
+  return like || [];
 }
 
-async function findProductByBarcode(barcode) {
-  const { data, error } = await supabase
-    .from('products')
-    .select('貨品名稱, 條碼, 貨品編號')
-    .eq('條碼', barcode)
-    .maybeSingle();
-  if (error) throw error;
-  return data || null;
-}
-
-async function findProductBySku(sku) {
-  const { data, error } = await supabase
-    .from('products')
-    .select('貨品名稱, 條碼, 貨品編號')
-    .eq('貨品編號', sku)
-    .maybeSingle();
-  if (error) throw error;
-  return data || null;
-}
-
-// 取庫存（以 群組 + 貨品編號）
+// 查庫存（以 群組 + 貨品編號）
 async function getStockByGroupSku(group, sku) {
   const { data, error } = await supabase
     .from('inventory')
@@ -135,7 +123,7 @@ async function getStockByGroupSku(group, sku) {
   return { box: data?.['庫存箱數'] ?? 0, piece: data?.['庫存散數'] ?? 0 };
 }
 
-// 記錄/讀取 user_last_product（以「貨品編號」）
+// 記錄 / 取得最後查詢的貨品編號
 async function upsertUserLastProduct(lineUserId, group, sku) {
   const now = new Date().toISOString();
   const { data } = await supabase
@@ -144,7 +132,6 @@ async function upsertUserLastProduct(lineUserId, group, sku) {
     .eq('user_id', lineUserId)
     .eq('群組', group)
     .maybeSingle();
-
   if (data) {
     await supabase
       .from('user_last_product')
@@ -157,7 +144,6 @@ async function upsertUserLastProduct(lineUserId, group, sku) {
       .insert({ user_id: lineUserId, 群組: group, '貨品編號': sku, '建立時間': now });
   }
 }
-
 async function getLastSku(lineUserId, group) {
   const { data, error } = await supabase
     .from('user_last_product')
@@ -171,7 +157,7 @@ async function getLastSku(lineUserId, group) {
   return data?.['貨品編號'] || null;
 }
 
-// 以 群組 + SKU 操作庫存的 RPC（箱/件分開、不換算）
+// 以 群組 + SKU 操作庫存（RPC：箱/件分開、不換算）
 async function changeInventoryByGroupSku(group, sku, deltaBox, deltaPiece, userId, source='LINE') {
   const { data, error } = await supabase.rpc('exec_change_inventory_by_group_sku', {
     p_group: group,
@@ -185,7 +171,7 @@ async function changeInventoryByGroupSku(group, sku, deltaBox, deltaPiece, userI
   return data; // { new_box, new_piece }
 }
 
-// ---- routes ----
+// —— 路由 —— 
 app.get('/health', (_req, res) => res.status(200).send('OK'));
 
 app.post('/webhook', async (req, res) => {
@@ -210,8 +196,9 @@ async function handleEvent(event) {
   if (!parsed) {
     return reply([
       '指令：',
-      '• 查 可樂 / 查可樂 / 查 123456（條碼）',
-      '• 條碼123456 / 編號ABC123 / #ABC123',
+      '• 查 可樂（只搜名稱）',
+      '• 條碼12345（只搜條碼）',
+      '• 編號ABC123 / #ABC123（先精準貨品編號，找不到再模糊）',
       '• 入庫3箱2件 / 入3箱 / 入3件',
       '• 出庫1箱 / 出2件'
     ].join('\n'));
@@ -220,11 +207,10 @@ async function handleEvent(event) {
   const lineUserId = event.source?.userId || 'unknown';
   const group = await getUserGroup(lineUserId);
 
-  // 查詢（關鍵字：名稱/條碼/貨品編號 都可）
+  // 「查」名稱
   if (parsed.type === 'query') {
-    const list = await findProductsByKeyword(parsed.keyword);
+    const list = await searchByName(parsed.keyword);
     if (!list.length) return reply('查無此商品');
-
     const lines = [];
     for (const p of list) {
       const sku = p['貨品編號'];
@@ -235,27 +221,32 @@ async function handleEvent(event) {
     return reply(lines.join('\n\n'));
   }
 
-  // 條碼查詢（無空格也可）
+  // 「條碼」
   if (parsed.type === 'barcode') {
-    const p = await findProductByBarcode(parsed.barcode);
-    if (!p) return reply('查無此條碼商品');
+    const list = await searchByBarcode(parsed.barcode);
+    if (!list.length) return reply('查無此條碼商品');
+    const p = list[0];
     const sku = p['貨品編號'];
     const s = await getStockByGroupSku(group, sku);
     await upsertUserLastProduct(lineUserId, group, sku);
     return reply(`${p['貨品名稱']}${p['條碼'] ? `（${p['條碼']}）` : ''}\n編號：${sku}\n庫存：箱 ${s.box}、件 ${s.piece}`);
   }
 
-  // 編號查詢（支援「編號123 / #123」）
+  // 「編號」
   if (parsed.type === 'sku') {
-    const p = await findProductBySku(parsed.sku);
-    if (!p) return reply('查無此貨品編號');
-    const sku = p['貨品編號'];
-    const s = await getStockByGroupSku(group, sku);
-    await upsertUserLastProduct(lineUserId, group, sku);
-    return reply(`${p['貨品名稱']}${p['條碼'] ? `（${p['條碼']}）` : ''}\n編號：${sku}\n庫存：箱 ${s.box}、件 ${s.piece}`);
+    const list = await searchBySku(parsed.sku);
+    if (!list.length) return reply('查無此貨品編號');
+    const lines = [];
+    for (const p of list) {
+      const sku = p['貨品編號'];
+      const s = await getStockByGroupSku(group, sku);
+      lines.push(`${p['貨品名稱']}${p['條碼'] ? `（${p['條碼']}）` : ''}\n編號：${sku}\n庫存：箱 ${s.box}、件 ${s.piece}`);
+    }
+    await upsertUserLastProduct(lineUserId, group, list[0]['貨品編號']);
+    return reply(lines.join('\n\n'));
   }
 
-  // 出入庫（依「最後查詢的貨品編號」）
+  // 出入庫（用「最後查到的貨品編號」）
   if (parsed.type === 'change') {
     if (parsed.box === 0 && parsed.piece === 0) return reply('數量為 0，請輸入箱或件。');
 
@@ -274,6 +265,13 @@ async function handleEvent(event) {
     }
   }
 }
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[UNHANDLED REJECTION]', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[UNCAUGHT EXCEPTION]', err);
+});
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
