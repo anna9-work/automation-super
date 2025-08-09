@@ -1,29 +1,19 @@
 {
   "name": "linebot-supabase-stock",
   "version": "1.0.0",
-  "description": "LINE Bot 結合 Supabase 的分店庫存管理系統",
+  "description": "LINE Bot + Supabase 庫存管理",
   "main": "index.js",
   "type": "module",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "@line/bot-sdk": "^7.7.0",
-    "@supabase/supabase-js": "^2.53.0",
+    "@line/bot-sdk": "^7.5.0",
+    "@supabase/supabase-js": "^2.43.0",
     "dotenv": "^17.2.1",
-    "express": "^4.21.2",
-    "json2csv": "^6.0.0-alpha.2"
+    "express": "^4.19.2"
   },
   "engines": {
-    "node": ">=18"
-  },
-  "keywords": [
-    "linebot",
-    "supabase",
-    "inventory",
-    "stock",
-    "nodejs"
-  ],
-  "author": "Anna",
-  "license": "MIT"
+    "node": "20.x"
+  }
 }
