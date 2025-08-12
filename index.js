@@ -56,8 +56,8 @@ function parseCommand(text) {
   if (mQuery) return { type: 'query', keyword: mQuery[1].trim() };
 
   // 出入庫（支援 散/件，和尾數字即散）
-  // 群組1: 入/出類型；群組2: 箱數；群組3: 散(件)；群組4: 尾數字(視為散)
-  const mChange = t.match(/^(入庫|入|出庫|出)\s*(?:(\d+)\s*箱)?\s*(?:(\d+)\s*(?:件|散))?(?:\s*(\d+))?$/);
+  // 群組1: 入/出類型；群組2: 箱數；群組3: 散(個)；群組4: 尾數字(視為散)
+  const mChange = t.match(/^(入庫|入|出庫|出)\s*(?:(\d+)\s*箱)?\s*(?:(\d+)\s*(?:個|散))?(?:\s*(\d+))?$/);
   if (mChange) {
     const box = mChange[2] ? parseInt(mChange[2], 10) : 0;
     const pieceLabeled = mChange[3] ? parseInt(mChange[3], 10) : 0;
@@ -282,7 +282,7 @@ async function handleEvent(event) {
     const sku = p['貨品編號'];
     const s = await getStockByGroupSku(group, sku);
     await upsertUserLastProduct(lineUserId, group, sku);
-    return replyText(`${p['貨品名稱']}${p['條碼'] ? `（${p['條碼']}）` : ''}\n編號：${sku}\n庫存：箱 ${s.box}、件 ${s.piece}`);
+    return replyText(`${p['貨品名稱']}${p['條碼'] ? `（${p['條碼']}）` : ''}\n編號：${sku}\n庫存：${s.box}箱、${s.piece}散`);
   }
 
   // 「條碼」
@@ -293,7 +293,7 @@ async function handleEvent(event) {
     const sku = p['貨品編號'];
     const s = await getStockByGroupSku(group, sku);
     await upsertUserLastProduct(lineUserId, group, sku);
-    return replyText(`${p['貨品名稱']}${p['條碼'] ? `（${p['條碼']}）` : ''}\n編號：${sku}\n庫存：箱 ${s.box}、件 ${s.piece}`);
+    return replyText(`${p['貨品名稱']}${p['條碼'] ? `（${p['條碼']}）` : ''}\n編號：${sku}\n庫存： ${s.box}箱、${s.piece}散`);
   }
 
   // 「編號」
@@ -313,7 +313,7 @@ async function handleEvent(event) {
     const sku = p['貨品編號'];
     const s = await getStockByGroupSku(group, sku);
     await upsertUserLastProduct(lineUserId, group, sku);
-    return replyText(`${p['貨品名稱']}${p['條碼'] ? `（${p['條碼']}）` : ''}\n編號：${sku}\n庫存：箱 ${s.box}、件 ${s.piece}`);
+    return replyText(`${p['貨品名稱']}${p['條碼'] ? `（${p['條碼']}）` : ''}\n編號：${sku}\n庫存： ${s.box}箱、 ${s.piece}散`);
   }
 
   // 出入庫（用「最後查到的貨品編號」）
@@ -337,7 +337,7 @@ async function handleEvent(event) {
         nb = s.box; np = s.piece;
       }
       const sign = (n) => (n >= 0 ? `+${n}` : `${n}`);
-      return replyText(`貨品編號：${sku}\n變動：箱 ${sign(deltaBox)}、件 ${sign(deltaPiece)}\n目前庫存：箱 ${nb}、件 ${np}`);
+      return replyText(`貨品編號：${sku}\n變動： ${sign(deltaBox)}箱、 ${sign(deltaPiece)}個\n目前庫存： ${nb}箱、 ${np}散`);
     } catch (err) {
       return replyText(`操作失敗：${err?.message || '未知錯誤'}`);
     }
