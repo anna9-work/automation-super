@@ -1,3 +1,6 @@
+const keys = ['SUPABASE_URL','SUPABASE_SERVICE_ROLE_KEY','LINE_CHANNEL_ACCESS_TOKEN','LINE_CHANNEL_SECRET'];
+for (const k of keys) console.log(`[ENV] ${k}:`, process.env[k] ? 'OK' : 'MISSING');
+
 import 'dotenv/config'; // <- 這行要在最上面
 import express from 'express';
 import dotenv from 'dotenv';
