@@ -15,10 +15,9 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANO
 const app = express();
 app.use(express.json());
 
-// 只處理 LINE webhook
 app.post('/webhook', async (req, res) => {
   try {
-    const events = req.body.events || [];
+    const events = Array.isArray(req.body?.events) ? req.body.events : [];
     for (const event of events) {
       await handleEvent(event);
     }
@@ -33,21 +32,27 @@ async function handleEvent(event) {
   if (event.type !== 'message' || event.message.type !== 'text') return;
 
   const userId = event.source.userId || null;
-  const groupId = event.source.type === 'group' ? event.source.groupId : null;
+  const isGroup = event.source.type === 'group';
+  const groupId = isGroup ? event.source.groupId : null;
   const text = (event.message.text || '').trim();
 
-  // 只回應這些指令，其他一律忽略
+  // ✅ 群組：第一次互動自動回覆 groupId，並在 line_groups 建立一筆（避免洗版）
+  if (isGroup) {
+    const replied = await ensureGroupRegisteredOnce(event);
+    // 不管是否剛插入，都繼續處理指令；若尚未設定分店，後面會提示管理員綁定
+  }
+
+  // 只回應這些指令，其它忽略
   const isCommand =
     /^查\s*/.test(text) ||
     /^編號\s*/.test(text) ||
     /^條碼\s*/.test(text) ||
     /^入/.test(text) ||
     /^出/.test(text);
-
   if (!isCommand) return;
 
-  // 自動註冊使用者（私訊時）
-  if (userId) await autoRegisterUser(userId);
+  // 私訊：自動註冊使用者（群組內不用）
+  if (userId && !isGroup) await autoRegisterUser(userId);
 
   // 先決定分店 & 角色
   const { branch, role, blocked, needBindMsg } = await resolveBranchAndRole({ userId, groupId });
@@ -64,9 +69,9 @@ async function handleEvent(event) {
     return;
   }
 
-  // 指令路由
+  // 路由
   if (/^入/.test(text)) {
-    // user 不能入庫；主管可
+    // 🔒 權限：user 不能入庫，主管可
     if (role !== '主管') {
       await replyText(event.replyToken, '您沒有權限使用「入庫」');
       return;
@@ -76,7 +81,7 @@ async function handleEvent(event) {
   }
 
   if (/^出/.test(text)) {
-    // user/主管都可
+    // 出庫：user/主管都可
     await handleStockOut(event, text, { branch, role });
     return;
   }
@@ -97,24 +102,57 @@ async function handleEvent(event) {
   }
 }
 
-/* ----------------- 共用：分店與身分 ----------------- */
+/* ----------------- 群組首次回覆 groupId（只回一次） ----------------- */
+async function ensureGroupRegisteredOnce(event) {
+  const groupId = event.source.groupId;
+  if (!groupId) return false;
+
+  // 已存在就不回覆
+  const { data: exists } = await supabase
+    .from('line_groups')
+    .select('line_group_id')
+    .eq('line_group_id', groupId)
+    .maybeSingle();
+
+  if (exists) return false;
+
+  // 新增一筆（先只記 groupId，等待管理員在 DB 設定 群組=catch_000x）
+  await supabase.from('line_groups').insert({ line_group_id: groupId });
+
+  try {
+    await client.replyMessage(event.replyToken, {
+      type: 'text',
+      text:
+        `這是本群的 groupId：\n${groupId}\n\n` +
+        `請管理員到資料庫的 line_groups 設定此群對應的分店（欄位「群組」填 catch_0001 / catch_0002 / ...）。\n` +
+        `完成後，群組內就能依該分店查/出庫。`,
+    });
+  } catch (e) {
+    console.error('reply groupId error:', e);
+  }
+  return true;
+}
+
+/* ----------------- 分店/角色解析 ----------------- */
 async function resolveBranchAndRole({ userId, groupId }) {
-  // 先看是否群組聊天室
   if (groupId) {
-    // 用 line_groups 綁定
+    // 群組優先：line_groups 綁定分店
     const { data: lg } = await supabase
       .from('line_groups')
       .select('群組')
       .eq('line_group_id', groupId)
-      .single();
-
+      .maybeSingle();
     const branch = lg?.群組 || null;
 
-    // 群組裡的角色全部視為 user？或不看角色？→ 我們沿用 users 角色（若查不到，一律當 user）
+    // 角色：沿用 users（找不到就當 user）
     let role = 'user';
     let blocked = false;
     if (userId) {
-      const { data: u } = await supabase.from('users').select('角色,黑名單').eq('user_id', userId).single();
+      const { data: u } = await supabase
+        .from('users')
+        .select('角色,黑名單')
+        .eq('user_id', userId)
+        .maybeSingle();
       role = u?.角色 || 'user';
       blocked = !!u?.黑名單;
     }
@@ -123,11 +161,11 @@ async function resolveBranchAndRole({ userId, groupId }) {
       branch,
       role,
       blocked,
-      needBindMsg: '此群組尚未綁定分店，請管理員在 line_groups 綁定分店（catch_0001/0002/0003）',
+      needBindMsg: '此群組尚未綁定分店，請管理員在 line_groups.群組 設為 catch_0001/0002/0003',
     };
   }
 
-  // 私訊：用 users.群組
+  // 私訊：看 users.群組
   let role = 'user';
   let branch = null;
   let blocked = false;
@@ -137,7 +175,7 @@ async function resolveBranchAndRole({ userId, groupId }) {
       .from('users')
       .select('群組,角色,黑名單')
       .eq('user_id', userId)
-      .single();
+      .maybeSingle();
     branch = u?.群組 || null;
     role = u?.角色 || 'user';
     blocked = !!u?.黑名單;
@@ -147,12 +185,12 @@ async function resolveBranchAndRole({ userId, groupId }) {
     branch,
     role,
     blocked,
-    needBindMsg: '此使用者尚未綁定分店，請管理員在 users.群組 設定（catch_0001/0002/0003）',
+    needBindMsg: '此使用者尚未綁定分店，請管理員在 users.群組 設為 catch_0001/0002/0003',
   };
 }
 
 async function autoRegisterUser(userId) {
-  const { data } = await supabase.from('users').select('user_id').eq('user_id', userId).single();
+  const { data } = await supabase.from('users').select('user_id').eq('user_id', userId).maybeSingle();
   if (!data) {
     await supabase.from('users').insert({
       user_id: userId,
@@ -163,25 +201,23 @@ async function autoRegisterUser(userId) {
   }
 }
 
-/* ----------------- 查詢（user 只看庫存>0；主管不限制） ----------------- */
+/* ----------------- 查詢（user 只看庫存>0；主管不限） ----------------- */
 async function handleSearchByName(event, keyword, ctx) {
   if (!keyword) {
     await replyText(event.replyToken, '請輸入關鍵字，例如「查 可樂」');
     return;
   }
-  // 找產品（最多 20 筆）
   const { data: products } = await supabase
     .from('products')
     .select('貨品編號,貨品名稱')
     .ilike('貨品名稱', `%${keyword}%`)
-    .limit(20);
+    .limit(50);
 
   if (!products || products.length === 0) {
     await replyText(event.replyToken, '查無此商品');
     return;
   }
 
-  // 抓該分店的庫存
   const skuList = products.map((p) => p.貨品編號);
   const { data: invRows } = await supabase
     .from('inventory')
@@ -197,9 +233,8 @@ async function handleSearchByName(event, keyword, ctx) {
     return { ...p, 庫存箱數: b, 庫存散數: s };
   });
 
-  // user：過濾掉庫存=0
   if (ctx.role !== '主管') {
-    result = result.filter((r) => (r.庫存箱數 > 0) || (r.庫存散數 > 0));
+    result = result.filter((r) => r.庫存箱數 > 0 || r.庫存散數 > 0);
   }
 
   if (result.length === 0) {
@@ -210,21 +245,13 @@ async function handleSearchByName(event, keyword, ctx) {
   if (result.length === 1) {
     const p = result[0];
     await upsertUserLastProduct(event.source.userId, ctx.branch, p.貨品編號);
-    await replyText(
-      event.replyToken,
-      `${p.貨品名稱}\n目前庫存：箱 ${p.庫存箱數}、散 ${p.庫存散數}`
-    );
+    await replyText(event.replyToken, `${p.貨品名稱}\n目前庫存：箱 ${p.庫存箱數}、散 ${p.庫存散數}`);
     return;
   }
 
-  // 多筆 → quick reply（顯示名稱，點了回「編號 #SKU」）
   const items = result.slice(0, 12).map((p) => ({
     type: 'action',
-    action: {
-      type: 'message',
-      label: p.貨品名稱,
-      text: `編號 ${p.貨品編號}`,
-    },
+    action: { type: 'message', label: p.貨品名稱, text: `編號 ${p.貨品編號}` },
   }));
 
   await client.replyMessage(event.replyToken, {
@@ -243,7 +270,7 @@ async function handleSearchBySku(event, sku, ctx) {
     .from('products')
     .select('貨品編號,貨品名稱')
     .eq('貨品編號', sku)
-    .single();
+    .maybeSingle();
 
   if (!product) {
     await replyText(event.replyToken, '查無此商品');
@@ -255,7 +282,7 @@ async function handleSearchBySku(event, sku, ctx) {
     .select('庫存箱數,庫存散數')
     .eq('群組', ctx.branch)
     .eq('貨品編號', sku)
-    .single();
+    .maybeSingle();
 
   const b = inv?.庫存箱數 ?? 0;
   const s = inv?.庫存散數 ?? 0;
@@ -278,7 +305,7 @@ async function handleSearchByBarcode(event, barcode, ctx) {
     .from('products')
     .select('貨品編號,貨品名稱')
     .eq('條碼', barcode)
-    .single();
+    .maybeSingle();
 
   if (!product) {
     await replyText(event.replyToken, '查無此條碼商品');
@@ -290,7 +317,7 @@ async function handleSearchByBarcode(event, barcode, ctx) {
     .select('庫存箱數,庫存散數')
     .eq('群組', ctx.branch)
     .eq('貨品編號', product.貨品編號)
-    .single();
+    .maybeSingle();
 
   const b = inv?.庫存箱數 ?? 0;
   const s = inv?.庫存散數 ?? 0;
@@ -304,10 +331,8 @@ async function handleSearchByBarcode(event, barcode, ctx) {
   await replyText(event.replyToken, `${product.貨品名稱}\n目前庫存：箱 ${b}、散 ${s}`);
 }
 
-/* ----------------- 入/出庫（箱/散各自變動；不換算） ----------------- */
-// 支援：入庫3箱2散 / 入3箱1 / 入3箱 / 入3散
-const REG_IN = /^入(?:庫)?\s*(?:(\d+)\s*箱)?\s*(?:(\d+)\s*(?:件|散))?$/;
-// 支援：出3箱2散 / 出3箱 / 出3散 / 出1
+/* ----------------- 入/出庫（箱/散不換算） ----------------- */
+const REG_IN  = /^入(?:庫)?\s*(?:(\d+)\s*箱)?\s*(?:(\d+)\s*(?:件|散))?$/;
 const REG_OUT = /^出\s*(?:(\d+)\s*箱)?\s*(?:(\d+)\s*(?:件|散))?$/;
 
 async function handleStockIn(event, text, ctx) {
@@ -326,33 +351,29 @@ async function handleStockIn(event, text, ctx) {
     return;
   }
 
-  // 產品資料
   const { data: prod } = await supabase
     .from('products')
     .select('貨品名稱,箱入數,單價')
     .eq('貨品編號', last.貨品編號)
-    .single();
+    .maybeSingle();
 
-  // 讀當前庫存
   const { data: inv } = await supabase
     .from('inventory')
     .select('庫存箱數,庫存散數')
     .eq('群組', ctx.branch)
     .eq('貨品編號', last.貨品編號)
-    .single();
+    .maybeSingle();
 
   const curB = inv?.庫存箱數 ?? 0;
   const curP = inv?.庫存散數 ?? 0;
   const newB = curB + deltaBox;
   const newP = curP + deltaPiece;
 
-  // 金額（不換算，僅用箱入數/單價計算加總金額）
   const units = toInt(prod?.箱入數, 1);
   const price = toNum(prod?.單價, 0);
   const inAmount = deltaBox * units * price + deltaPiece * price;
   const stockAmount = newB * units * price + newP * price;
 
-  // 寫入日誌
   await supabase.from('inventory_logs').insert({
     user_id: userId,
     群組: ctx.branch,
@@ -371,7 +392,6 @@ async function handleStockIn(event, text, ctx) {
     建立時間: new Date().toISOString(),
   });
 
-  // 更新 inventory（upsert）
   await upsertInventory(ctx.branch, last.貨品編號, newB, newP);
 
   await replyText(
@@ -388,7 +408,7 @@ async function handleStockOut(event, text, ctx) {
     return;
   }
   const deltaBox = m[1] ? parseInt(m[1], 10) : 0;
-  const deltaPiece = m[2] ? parseInt(m[2], 10) : (m[1] ? 0 : 0); // 未填即 0
+  const deltaPiece = m[2] ? parseInt(m[2], 10) : 0;
 
   const last = await fetchLastProduct(userId, ctx.branch);
   if (!last) {
@@ -396,28 +416,24 @@ async function handleStockOut(event, text, ctx) {
     return;
   }
 
-  // 產品 & 當前庫存
   const { data: prod } = await supabase
     .from('products')
     .select('貨品名稱,箱入數,單價')
     .eq('貨品編號', last.貨品編號)
-    .single();
+    .maybeSingle();
 
   const { data: inv } = await supabase
     .from('inventory')
     .select('庫存箱數,庫存散數')
     .eq('群組', ctx.branch)
     .eq('貨品編號', last.貨品編號)
-    .single();
+    .maybeSingle();
 
   const curB = inv?.庫存箱數 ?? 0;
   const curP = inv?.庫存散數 ?? 0;
 
   if (deltaBox > curB || deltaPiece > curP) {
-    await replyText(
-      event.replyToken,
-      `庫存不足\n目前庫存：箱 ${curB}、散 ${curP}`
-    );
+    await replyText(event.replyToken, `庫存不足\n目前庫存：箱 ${curB}、散 ${curP}`);
     return;
   }
 
@@ -429,7 +445,6 @@ async function handleStockOut(event, text, ctx) {
   const outAmount = deltaBox * units * price + deltaPiece * price;
   const stockAmount = newB * units * price + newP * price;
 
-  // 寫入日誌
   await supabase.from('inventory_logs').insert({
     user_id: userId,
     群組: ctx.branch,
@@ -458,13 +473,12 @@ async function handleStockOut(event, text, ctx) {
 
 /* ----------------- DB helpers ----------------- */
 async function upsertInventory(branch, sku, box, piece) {
-  // 先查是否存在
   const { data: row } = await supabase
     .from('inventory')
     .select('貨品編號')
     .eq('群組', branch)
     .eq('貨品編號', sku)
-    .single();
+    .maybeSingle();
 
   if (row) {
     await supabase
@@ -492,7 +506,7 @@ async function fetchLastProduct(userId, branch) {
     .eq('群組', branch)
     .order('建立時間', { ascending: false })
     .limit(1)
-    .single();
+    .maybeSingle();
   return data || null;
 }
 
@@ -504,7 +518,7 @@ async function upsertUserLastProduct(user_id, branch, sku) {
     .select('id')
     .eq('user_id', user_id)
     .eq('群組', branch)
-    .single();
+    .maybeSingle();
   if (data) {
     await supabase
       .from('user_last_product')
@@ -521,7 +535,7 @@ async function upsertUserLastProduct(user_id, branch, sku) {
   }
 }
 
-/* ----------------- 小工具 ----------------- */
+/* ----------------- utils ----------------- */
 async function replyText(replyToken, text) {
   try {
     await client.replyMessage(replyToken, { type: 'text', text: String(text) });
@@ -529,13 +543,12 @@ async function replyText(replyToken, text) {
     console.error('reply error:', e);
   }
 }
-
 function toInt(v, def = 0) {
-  const n = parseInt(String(v || '').replace(/[^\d-]/g, ''), 10);
+  const n = parseInt(String(v ?? '').replace(/[^\d-]/g, ''), 10);
   return Number.isFinite(n) ? n : def;
 }
 function toNum(v, def = 0) {
-  const n = Number(String(v || '').replace(/[^\d.-]/g, ''));
+  const n = Number(String(v ?? '').replace(/[^\d.-]/g, ''));
   return Number.isFinite(n) ? n : def;
 }
 
