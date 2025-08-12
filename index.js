@@ -1,3 +1,4 @@
+import 'dotenv/config'; // <- 這行要在最上面
 import express from 'express';
 import dotenv from 'dotenv';
 import line from '@line/bot-sdk';
