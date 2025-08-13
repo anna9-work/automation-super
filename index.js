@@ -1,4 +1,3 @@
-那你用這份index.js改
 import 'dotenv/config';
 import express from 'express';
 import line from '@line/bot-sdk';
