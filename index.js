@@ -109,7 +109,7 @@ async function resolveBranchAndRole(event) {
       branch,
       role,
       blocked,
-      needBindMsg: '此群組尚未綁定分店，請管理員在 line_groups.群組 設為 catch_0001/0002/0003'
+      needBindMsg: '此群組尚未綁定分店，請管理員設定'
     };
   } else {
     // 私訊：看 users.群組
@@ -123,7 +123,7 @@ async function resolveBranchAndRole(event) {
       branch,
       role,
       blocked,
-      needBindMsg: '此使用者尚未綁定分店，請管理員在 users.群組 設為 catch_0001/0002/0003'
+      needBindMsg: '此使用者尚未綁定分店，請管理員設定'
     };
   }
 }
@@ -448,7 +448,7 @@ async function handleEvent(event) {
   if (parsed.type === 'change') {
     // 權限檢查：入庫只允許主管
     if (parsed.action === 'in' && role !== '主管') {
-      await replyText('您沒有權限使用「入庫」');
+      await replyText('您無法使用「入庫」');
       return;
     }
 
