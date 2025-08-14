@@ -378,7 +378,7 @@ async function handleEvent(event) {
     if (list.length > 1) {
       await reply({
         type: 'text',
-        text: `找到 ${list.length} 筆，請從下方選單選擇：`,
+        text: `找到以下與「${parsed.keyword}」相關的選項`,
         quickReply: buildQuickReplyForProducts(list)
       });
       return;
@@ -392,7 +392,7 @@ async function handleEvent(event) {
       return;
     }
     await upsertUserLastProduct(lineUserId, branch, sku);
-    await replyText(`${p['貨品名稱']}${p['條碼'] ? `（${p['條碼']}）` : ''}\n編號：${sku}\n庫存：${s.box}箱、${s.piece}散`);
+    await replyText(`貨品名稱：${p['貨品名稱']} (/p)貨品編號：${sku}(/p)目前庫存：${s.box}箱${s.piece}散`);
     return;
   }
 
@@ -426,7 +426,7 @@ async function handleEvent(event) {
     if (list.length > 1) {
       await reply({
         type: 'text',
-        text: `找到 ${list.length} 筆，請從下方選單選擇：`,
+        text: `找到以下與「${parsed.sku}」相關的選項`,
         quickReply: buildQuickReplyForProducts(list)
       });
       return;
@@ -474,7 +474,16 @@ async function handleEvent(event) {
         nb = s.box; np = s.piece;
       }
       const sign = (n) => (n >= 0 ? `+${n}` : `${n}`);
-      await replyText(`貨品編號：${sku}\n變動： ${sign(deltaBox)}箱、 ${sign(deltaPiece)}散\n目前庫存： ${nb}箱、 ${np}散`);
+
+      // 取得貨品名稱（僅用於回覆顯示）
+      const { data: prodNameRow } = await supabase
+        .from('products')
+        .select('貨品名稱')
+        .eq('貨品編號', sku)
+        .maybeSingle();
+      const prodName = prodNameRow?.['貨品名稱'] || sku;
+
+      await replyText(`${parsed.action === 'in' ? '入庫成功' : '出庫成功'}(/p)貨品名稱：${prodName}(/p)目前庫存${nb}箱${np}散`);
       return;
     } catch (err) {
       console.error('change error:', err);
