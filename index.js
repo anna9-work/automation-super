@@ -483,7 +483,7 @@ async function handleEvent(event) {
         .maybeSingle();
       const prodName = prodNameRow?.['貨品名稱'] || sku;
 
-      await replyText(`${parsed.action === 'in' ? '✅入庫成功' : '✅出庫成功'}\n貨品名稱：${prodName}\n目前庫存${nb}箱${np}散`);
+      await replyText(`${parsed.action === 'in' ? '✅ 入庫成功' : '✅ 出庫成功'}\n貨品名稱 📄：${prodName}\n目前庫存：${nb}箱${np}散`);
       return;
     } catch (err) {
       console.error('change error:', err);
