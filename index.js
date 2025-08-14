@@ -392,7 +392,7 @@ async function handleEvent(event) {
       return;
     }
     await upsertUserLastProduct(lineUserId, branch, sku);
-    await replyText(`貨品名稱：${p['貨品名稱']} (/p)貨品編號：${sku}(/p)目前庫存：${s.box}箱${s.piece}散`);
+    await replyText(`貨品名稱：${p['貨品名稱']} \n貨品編號：${sku}\n目前庫存：${s.box}箱${s.piece}散`);
     return;
   }
 
@@ -483,7 +483,7 @@ async function handleEvent(event) {
         .maybeSingle();
       const prodName = prodNameRow?.['貨品名稱'] || sku;
 
-      await replyText(`${parsed.action === 'in' ? '✅入庫成功' : '✅出庫成功'}(/p)貨品名稱：${prodName}(/p)目前庫存${nb}箱${np}散`);
+      await replyText(`${parsed.action === 'in' ? '✅入庫成功' : '✅出庫成功'}\n貨品名稱：${prodName}\n目前庫存${nb}箱${np}散`);
       return;
     } catch (err) {
       console.error('change error:', err);
