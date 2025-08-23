@@ -162,7 +162,7 @@ async function getInStockSkuSet(branch) {
 async function searchByName(keyword, role, branch, inStockSet) {
   const { data, error } = await supabase
     .from('products')
-    .select('貨品名稱, 貨品編號, 條碼')
+    .select('貨品名稱, 貨品編號, 箱入數, 單價')
     .ilike('貨品名稱', `%${keyword}%`)
     .limit(20);
   if (error) throw error;
@@ -176,7 +176,7 @@ async function searchByName(keyword, role, branch, inStockSet) {
 async function searchByBarcode(barcode, role, branch, inStockSet) {
   const { data, error } = await supabase
     .from('products')
-    .select('貨品名稱, 貨品編號, 條碼')
+    .select('貨品名稱, 貨品編號, 箱入數, 單價')
     .eq('條碼', barcode.trim())
     .maybeSingle();
   if (error) throw error;
@@ -189,7 +189,7 @@ async function searchBySku(sku, role, branch, inStockSet) {
   // 精準
   const { data: exact, error: e1 } = await supabase
     .from('products')
-    .select('貨品名稱, 貨品編號, 條碼')
+    .select('貨品名稱, 貨品編號, 箱入數, 單價')
     .eq('貨品編號', sku.trim())
     .maybeSingle();
   if (e1) throw e1;
@@ -200,7 +200,7 @@ async function searchBySku(sku, role, branch, inStockSet) {
   // 模糊
   const { data: like, error: e2 } = await supabase
     .from('products')
-    .select('貨品名稱, 貨品編號, 條碼')
+    .select('貨品名稱, 貨品編號, 箱入數, 單價')
     .ilike('貨品編號', `%${sku}%`)
     .limit(20);
   if (e2) throw e2;
@@ -392,7 +392,11 @@ async function handleEvent(event) {
       return;
     }
     await upsertUserLastProduct(lineUserId, branch, sku);
-    await replyText(`貨品名稱：${p['貨品名稱']} \n貨品編號：${sku}\n目前庫存：${s.box}箱${s.piece}散`);
+    const boxSize = p['箱入數'] ?? '-';
+    const price = p['單價'] ?? '-';
+    await replyText(
+      `名稱：${p['貨品名稱']}\n編號：${sku}\n箱入數：${boxSize}\n單價：${price}\n庫存：${s.box}箱${s.piece}散`
+    );
     return;
   }
 
@@ -411,7 +415,11 @@ async function handleEvent(event) {
       return;
     }
     await upsertUserLastProduct(lineUserId, branch, sku);
-    await replyText(`${p['貨品名稱']}${p['條碼'] ? `（${p['條碼']}）` : ''}\n編號：${sku}\n庫存： ${s.box}箱、${s.piece}散`);
+    const boxSize = p['箱入數'] ?? '-';
+    const price = p['單價'] ?? '-';
+    await replyText(
+      `名稱：${p['貨品名稱']}\n編號：${sku}\n箱入數：${boxSize}\n單價：${price}\n庫存：${s.box}箱${s.piece}散`
+    );
     return;
   }
 
@@ -440,7 +448,11 @@ async function handleEvent(event) {
       return;
     }
     await upsertUserLastProduct(lineUserId, branch, sku);
-    await replyText(`${p['貨品名稱']}${p['條碼'] ? `（${p['條碼']}）` : ''}\n貨品編號：${sku}\n目前庫存： ${s.box}箱、 ${s.piece}散`);
+    const boxSize = p['箱入數'] ?? '-';
+    const price = p['單價'] ?? '-';
+    await replyText(
+      `名稱：${p['貨品名稱']}\n編號：${sku}\n箱入數：${boxSize}\n單價：${price}\n庫存：${s.box}箱${s.piece}散`
+    );
     return;
   }
 
