@@ -72,14 +72,18 @@ function parseCommand(text) {
   return null;
 }
 
-/** 依事件來源解析分店與角色 */
+/** 依事件來源解析分店與角色
+ * 群組聊天室：查 line_groups by groupId → 得到「群組」（分店代號）
+ * 私訊：查 users by userId 的 群組
+ * 角色：一律看 users.角色（查不到預設 user）
+ */
 async function resolveBranchAndRole(event) {
   const source = event.source || {};
   const userId = source.userId || null;
   const isGroup = source.type === 'group';
   const groupId = isGroup ? source.groupId : null;
 
-  // 角色/黑名單
+  // 角色/黑名單（沿用 users；找不到視為 user / 未封鎖）
   let role = 'user';
   let blocked = false;
   if (userId) {
@@ -94,6 +98,7 @@ async function resolveBranchAndRole(event) {
 
   // 分店（branch）
   if (isGroup) {
+    // 以 line_groups 綁定為準
     const { data: lg } = await supabase
       .from('line_groups')
       .select('群組')
@@ -107,6 +112,7 @@ async function resolveBranchAndRole(event) {
       needBindMsg: '此群組尚未綁定分店，請管理員設定'
     };
   } else {
+    // 私訊：看 users.群組
     const { data: u2 } = await supabase
       .from('users')
       .select('群組')
@@ -136,7 +142,7 @@ async function autoRegisterUser(userId) {
   }
 }
 
-// 取「有庫存」的 SKU Set
+// 取「有庫存」的 SKU Set（群組內：庫存箱數>0 或 庫存散數>0）
 async function getInStockSkuSet(branch) {
   const { data, error } = await supabase
     .from('inventory')
@@ -152,11 +158,11 @@ async function getInStockSkuSet(branch) {
   return set;
 }
 
-// —— 查詢（select 一併取回 箱入數 與 單價/價格）——
+// —— 查詢（依你的規則）——
 async function searchByName(keyword, role, branch, inStockSet) {
   const { data, error } = await supabase
     .from('products')
-    .select('貨品名稱, 貨品編號, 條碼, 箱入數, 單價, 價格')
+    .select('貨品名稱, 貨品編號, 條碼')
     .ilike('貨品名稱', `%${keyword}%`)
     .limit(20);
   if (error) throw error;
@@ -170,7 +176,7 @@ async function searchByName(keyword, role, branch, inStockSet) {
 async function searchByBarcode(barcode, role, branch, inStockSet) {
   const { data, error } = await supabase
     .from('products')
-    .select('貨品名稱, 貨品編號, 條碼, 箱入數, 單價, 價格')
+    .select('貨品名稱, 貨品編號, 條碼')
     .eq('條碼', barcode.trim())
     .maybeSingle();
   if (error) throw error;
@@ -183,7 +189,7 @@ async function searchBySku(sku, role, branch, inStockSet) {
   // 精準
   const { data: exact, error: e1 } = await supabase
     .from('products')
-    .select('貨品名稱, 貨品編號, 條碼, 箱入數, 單價, 價格')
+    .select('貨品名稱, 貨品編號, 條碼')
     .eq('貨品編號', sku.trim())
     .maybeSingle();
   if (e1) throw e1;
@@ -194,7 +200,7 @@ async function searchBySku(sku, role, branch, inStockSet) {
   // 模糊
   const { data: like, error: e2 } = await supabase
     .from('products')
-    .select('貨品名稱, 貨品編號, 條碼, 箱入數, 單價, 價格')
+    .select('貨品名稱, 貨品編號, 條碼')
     .ilike('貨品編號', `%${sku}%`)
     .limit(20);
   if (e2) throw e2;
@@ -300,18 +306,33 @@ function logEventSummary(event) {
   }
 }
 
-// 顯示用：單價（優先 products.單價，其次 products.價格）
-function unitPriceText(p) {
-  const v = p?.['單價'] ?? p?.['價格'];
-  if (v === null || v === undefined || v === '') return '-';
-  return String(v);
-}
-// 顯示用：箱入數
-function packPerBoxText(p) {
-  const v = p?.['箱入數'];
-  if (v === null || v === undefined || v === '') return '-';
-  return String(v);
-}
+// —— 路由 —— 
+app.get('/health', (_req, res) => res.status(200).send('OK'));
+app.get('/', (_req, res) => res.status(200).send('RUNNING'));
+
+app.post('/webhook', async (req, res) => {
+  try {
+    const events = req.body?.events || [];
+
+    // ※ 如需完整原始 JSON，打開下行註解（log 會較多）
+    // console.log('[WEBHOOK RAW]', JSON.stringify(req.body, null, 2));
+
+    for (const ev of events) {
+      // 每個事件都印出 groupId/roomId/userId/文字，方便在 Railway Logs 搜尋
+      logEventSummary(ev);
+
+      try {
+        await handleEvent(ev);
+      } catch (err) {
+        console.error('[HANDLE EVENT ERROR]', err);
+      }
+    }
+    res.status(200).send('OK');
+  } catch (e) {
+    console.error('[WEBHOOK ERROR]', e);
+    res.status(500).send('ERR');
+  }
+});
 
 async function handleEvent(event) {
   if (event.type !== 'message' || event.message.type !== 'text') return;
@@ -346,21 +367,6 @@ async function handleEvent(event) {
   // 預先取得 in-stock set（給 user 過濾）
   const inStockSet = role === 'user' ? await getInStockSkuSet(branch) : new Set();
 
-  // 統一的文字輸出（不顯示條碼）
-  const buildSingleProductText = async (p) => {
-    const sku = p['貨品編號'];
-    const s = await getStockByGroupSku(branch, sku);
-    if (role === 'user' && s.box === 0 && s.piece === 0) return null;
-    await upsertUserLastProduct(lineUserId, branch, sku);
-    return [
-      `名稱：${p['貨品名稱']}`,
-      `編號：${sku}`,
-      `箱入數：${packPerBoxText(p)}`,
-      `單價：${unitPriceText(p)}`,
-      `庫存：${s.box}箱、${s.piece}散`
-    ].join('\n');
-  };
-
   // 「查」名稱
   if (parsed.type === 'query') {
     const list = await searchByName(parsed.keyword, role, branch, inStockSet);
@@ -378,12 +384,15 @@ async function handleEvent(event) {
       return;
     }
 
-    const textOut = await buildSingleProductText(list[0]);
-    if (!textOut) {
+    const p = list[0];
+    const sku = p['貨品編號'];
+    const s = await getStockByGroupSku(branch, sku);
+    if (role === 'user' && s.box === 0 && s.piece === 0) {
       await replyText('無此商品庫存');
       return;
     }
-    await replyText(textOut);
+    await upsertUserLastProduct(lineUserId, branch, sku);
+    await replyText(`貨品名稱：${p['貨品名稱']} \n貨品編號：${sku}\n目前庫存：${s.box}箱${s.piece}散`);
     return;
   }
 
@@ -394,12 +403,15 @@ async function handleEvent(event) {
       await replyText(role === '主管' ? '查無此條碼商品' : '無此商品庫存');
       return;
     }
-    const textOut = await buildSingleProductText(list[0]);
-    if (!textOut) {
+    const p = list[0];
+    const sku = p['貨品編號'];
+    const s = await getStockByGroupSku(branch, sku);
+    if (role === 'user' && s.box === 0 && s.piece === 0) {
       await replyText('無此商品庫存');
       return;
     }
-    await replyText(textOut);
+    await upsertUserLastProduct(lineUserId, branch, sku);
+    await replyText(`${p['貨品名稱']}${p['條碼'] ? `（${p['條碼']}）` : ''}\n編號：${sku}\n庫存： ${s.box}箱、${s.piece}散`);
     return;
   }
 
@@ -420,12 +432,15 @@ async function handleEvent(event) {
       return;
     }
 
-    const textOut = await buildSingleProductText(list[0]);
-    if (!textOut) {
+    const p = list[0];
+    const sku = p['貨品編號'];
+    const s = await getStockByGroupSku(branch, sku);
+    if (role === 'user' && s.box === 0 && s.piece === 0) {
       await replyText('無此商品庫存');
       return;
     }
-    await replyText(textOut);
+    await upsertUserLastProduct(lineUserId, branch, sku);
+    await replyText(`${p['貨品名稱']}${p['條碼'] ? `（${p['條碼']}）` : ''}\n貨品編號：${sku}\n目前庫存： ${s.box}箱、 ${s.piece}散`);
     return;
   }
 
@@ -450,6 +465,7 @@ async function handleEvent(event) {
 
     try {
       const r = await changeInventoryByGroupSku(branch, sku, deltaBox, deltaPiece, lineUserId, 'LINE');
+      // 防止回傳為 null/array 未取到值
       let nb = null, np = null;
       if (r && typeof r.new_box === 'number') nb = r.new_box;
       if (r && typeof r.new_piece === 'number') np = r.new_piece;
@@ -457,6 +473,7 @@ async function handleEvent(event) {
         const s = await getStockByGroupSku(branch, sku);
         nb = s.box; np = s.piece;
       }
+      const sign = (n) => (n >= 0 ? `+${n}` : `${n}`);
 
       // 取得貨品名稱（僅用於回覆顯示）
       const { data: prodNameRow } = await supabase
@@ -466,7 +483,7 @@ async function handleEvent(event) {
         .maybeSingle();
       const prodName = prodNameRow?.['貨品名稱'] || sku;
 
-      await replyText(`${parsed.action === 'in' ? '✅ 入庫成功' : '✅ 出庫成功'}\n名稱：${prodName}\n庫存：${nb}箱、${np}散`);
+      await replyText(`${parsed.action === 'in' ? '✅ 入庫成功' : '✅ 出庫成功'}\n貨品名稱 📄：${prodName}\n目前庫存：${nb}箱${np}散`);
       return;
     } catch (err) {
       console.error('change error:', err);
