@@ -28,45 +28,23 @@ const client = new line.Client({
 const supabase = createClient(SUPABASE_URL.replace(/\/+$/, ''), SUPABASE_SERVICE_ROLE_KEY);
 
 /** 先把 LINE 的 userId 解析成 auth.users.id（uuid）
- *  1) 以 line_user_map 為主
- *  2) 退而求其次：如果 public.users.id 存在且能對上 auth.users.id，就拿它
- *  找不到就回傳 null（上層決定要不要擋）
+ * 僅查 line_user_map（單一權威），避免跨 schema 帶來的權限/錯誤。
+ * 找不到就回傳 null（上層決定要不要擋）
  */
 async function resolveAuthUuidFromLineUserId(lineUserId) {
   if (!lineUserId) return null;
 
-  // 1) line_user_map
-  {
-    const { data, error } = await supabase
-      .from('line_user_map')
-      .select('auth_user_id')
-      .eq('line_user_id', lineUserId)
-      .maybeSingle();
-    if (error) console.warn('[resolveAuthUuid] line_user_map error:', error);
-    if (data?.auth_user_id) return data.auth_user_id;
-  }
+  const { data, error } = await supabase
+    .from('line_user_map')
+    .select('auth_user_id')
+    .eq('line_user_id', lineUserId)
+    .maybeSingle();
 
-  // 2) public.users.id 若正好是 auth.users.id
-  {
-    const { data, error } = await supabase
-      .from('users')
-      .select('id') // uuid
-      .eq('user_id', lineUserId)
-      .maybeSingle();
-    if (error) console.warn('[resolveAuthUuid] users query error:', error);
-    const candidate = data?.id;
-    if (candidate) {
-      // 確認 auth.users 存在
-      const { data: au, error: e2 } = await supabase
-        .from('auth.users') // supabase-js 支援跨 schema 需使用 rpc 或 rest，其它用法請依環境；若無法，請移除此段。
-        .select('id')
-        .eq('id', candidate)
-        .maybeSingle();
-      if (!e2 && au?.id) return candidate;
-    }
+  if (error) {
+    console.warn('[resolveAuthUuid] line_user_map error:', error);
+    return null;
   }
-
-  return null;
+  return data?.auth_user_id || null;
 }
 
 /** 指令解析 */
@@ -259,7 +237,7 @@ async function getLastSku(lineUserId, branch) {
 
 /** 變更庫存（先把 LINE userId 轉成 auth UUID，再呼叫你原本的 RPC） */
 async function changeInventoryByGroupSku(branch, sku, deltaBox, deltaPiece, lineUserId, source = 'LINE') {
-  // 先解析成 auth uuid
+  // 先解析成 auth uuid（只查 line_user_map）
   const authUuid = await resolveAuthUuidFromLineUserId(lineUserId);
   if (!authUuid) {
     const hint = '此 LINE 使用者尚未對應到 auth.users。請先在 line_user_map 建立對應。';
@@ -271,7 +249,7 @@ async function changeInventoryByGroupSku(branch, sku, deltaBox, deltaPiece, line
     p_sku: sku,
     p_delta_box: deltaBox,
     p_delta_piece: deltaPiece,
-    p_user_id: authUuid, // ★ 這裡改成 uuid
+    p_user_id: authUuid, // ★ 改為 uuid
     p_source: source
   });
   if (error) throw error;
@@ -374,6 +352,7 @@ async function handleEvent(event) {
     const list = await searchByBarcode(parsed.barcode, role, branch, inStockSet);
     if (!list.length) { await replyText(role === '主管' ? '查無此條碼商品' : '無此商品庫存'); return; }
     const p = list[0];
+    for (const _ of [0]) {} // no-op to keep structure identical
     const sku = p['貨品編號'];
     const s = await getStockByGroupSku(branch, sku);
     if (role === 'user' && s.box === 0 && s.piece === 0) { await replyText('無此商品庫存'); return; }
