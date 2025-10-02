@@ -9,7 +9,10 @@ const {
   LINE_CHANNEL_SECRET,
   SUPABASE_URL,
   SUPABASE_SERVICE_ROLE_KEY,
-  DEFAULT_GROUP = 'default'
+  DEFAULT_GROUP = 'default',
+  // ★ 新增：GAS Webhook
+  GAS_WEBHOOK_URL,          // 例： https://script.google.com/macros/s/AKfycbzmag_sI_UBSTylPqU_SyLbuKacmI4Xy4X_Aftdf85_7Og7lq_Byykrm47gSjuu84HqNQ/exec
+  GAS_WEBHOOK_SECRET        // 要跟 Apps Script Script Properties 的 WEBHOOK_SECRET 一致
 } = process.env;
 
 if (!LINE_CHANNEL_ACCESS_TOKEN || !LINE_CHANNEL_SECRET) {
@@ -18,28 +21,24 @@ if (!LINE_CHANNEL_ACCESS_TOKEN || !LINE_CHANNEL_SECRET) {
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.error('缺少 Supabase 環境變數 (URL / SERVICE_ROLE_KEY)');
 }
+if (!GAS_WEBHOOK_URL || !GAS_WEBHOOK_SECRET) {
+  console.error('缺少 GAS_WEBHOOK_URL / GAS_WEBHOOK_SECRET（即時推送到試算表會失效）');
+}
 
 const app = express();
 app.use(express.json());
 
-const client = new line.Client({
-  channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN
-});
+const client = new line.Client({ channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN });
 const supabase = createClient(SUPABASE_URL.replace(/\/+$/, ''), SUPABASE_SERVICE_ROLE_KEY);
 
-/** 先把 LINE 的 userId 解析成 auth.users.id（uuid）
- * 僅查 line_user_map（單一權威），避免跨 schema 帶來的權限/錯誤。
- * 找不到就回傳 null（上層決定要不要擋）
- */
+/** 只查 line_user_map，把 LINE userId 轉成 auth.users.id (uuid) */
 async function resolveAuthUuidFromLineUserId(lineUserId) {
   if (!lineUserId) return null;
-
   const { data, error } = await supabase
     .from('line_user_map')
     .select('auth_user_id')
     .eq('line_user_id', lineUserId)
     .maybeSingle();
-
   if (error) {
     console.warn('[resolveAuthUuid] line_user_map error:', error);
     return null;
@@ -235,21 +234,19 @@ async function getLastSku(lineUserId, branch) {
   return data?.['貨品編號'] || null;
 }
 
-/** 變更庫存（先把 LINE userId 轉成 auth UUID，再呼叫你原本的 RPC） */
+/** RPC：變更庫存（LINE userId 先轉 auth uuid） */
 async function changeInventoryByGroupSku(branch, sku, deltaBox, deltaPiece, lineUserId, source = 'LINE') {
-  // 先解析成 auth uuid（只查 line_user_map）
   const authUuid = await resolveAuthUuidFromLineUserId(lineUserId);
   if (!authUuid) {
     const hint = '此 LINE 使用者尚未對應到 auth.users。請先在 line_user_map 建立對應。';
     throw new Error(`找不到對應的使用者（${lineUserId}）。${hint}`);
   }
-
   const { data, error } = await supabase.rpc('exec_change_inventory_by_group_sku', {
     p_group: branch,
     p_sku: sku,
     p_delta_box: deltaBox,
     p_delta_piece: deltaPiece,
-    p_user_id: authUuid, // ★ 改為 uuid
+    p_user_id: authUuid,
     p_source: source
   });
   if (error) throw error;
@@ -257,15 +254,42 @@ async function changeInventoryByGroupSku(branch, sku, deltaBox, deltaPiece, line
   return row || { new_box: null, new_piece: null };
 }
 
+/** ★ 格式化成台北時區 +08:00 的 ISO（供 GAS 5:00 分界使用） */
+function formatTpeIso(date = new Date()) {
+  // 取 Asia/Taipei 的本地時間字串「YYYY-MM-DD HH:mm:ss」
+  const s = new Intl.DateTimeFormat('sv-SE', {
+    timeZone: 'Asia/Taipei',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+    hour12: false
+  }).format(date); // 例如 "2025-10-02 14:23:45"
+  return s.replace(' ', 'T') + '+08:00';
+}
+
+/** ★ 立即推送到 GAS（成功/失敗都不影響 LINE 回覆） */
+async function postInventoryToGAS(payload) {
+  if (!GAS_WEBHOOK_URL || !GAS_WEBHOOK_SECRET) return;
+  const url = `${GAS_WEBHOOK_URL.replace(/\?+.*/, '')}?secret=${encodeURIComponent(GAS_WEBHOOK_SECRET)}`;
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type':'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(()=>'');
+      console.warn('[GAS PUSH WARN]', res.status, txt);
+    }
+  } catch (e) {
+    console.warn('[GAS PUSH ERROR]', e);
+  }
+}
+
 /** LINE quick reply */
 function buildQuickReplyForProducts(products) {
   const items = products.slice(0, 12).map(p => ({
     type: 'action',
-    action: {
-      type: 'message',
-      label: `${p['貨品名稱']}`.slice(0, 20),
-      text: `編號 ${p['貨品編號']}`
-    }
+    action: { type: 'message', label: `${p['貨品名稱']}`.slice(0, 20), text: `編號 ${p['貨品編號']}` }
   }));
   return { items };
 }
@@ -280,9 +304,7 @@ function logEventSummary(event) {
     const roomId = isRoom ? src.roomId : null;
     const userId = src.userId || null;
     const text = msg?.type === 'text' ? msg.text : '';
-    console.log(
-      `[LINE EVENT] type=${event?.type} source=${src.type || '-'} groupId=${groupId || '-'} roomId=${roomId || '-'} userId=${userId || '-'} text="${text}"`
-    );
+    console.log(`[LINE EVENT] type=${event?.type} source=${src.type || '-'} groupId=${groupId || '-'} roomId=${roomId || '-'} userId=${userId || '-'} text="${text}"`);
   } catch (e) {
     console.error('[LINE EVENT LOG ERROR]', e);
   }
@@ -352,7 +374,6 @@ async function handleEvent(event) {
     const list = await searchByBarcode(parsed.barcode, role, branch, inStockSet);
     if (!list.length) { await replyText(role === '主管' ? '查無此條碼商品' : '無此商品庫存'); return; }
     const p = list[0];
-    for (const _ of [0]) {} // no-op to keep structure identical
     const sku = p['貨品編號'];
     const s = await getStockByGroupSku(branch, sku);
     if (role === 'user' && s.box === 0 && s.piece === 0) { await replyText('無此商品庫存'); return; }
@@ -392,6 +413,7 @@ async function handleEvent(event) {
     const deltaPiece = parsed.action === 'in' ? parsed.piece : -parsed.piece;
 
     try {
+      // 1) 先變更庫存（拿到新庫存）
       const r = await changeInventoryByGroupSku(branch, sku, deltaBox, deltaPiece, lineUserId, 'LINE');
       let nb = null, np = null;
       if (r && typeof r.new_box === 'number') nb = r.new_box;
@@ -400,12 +422,46 @@ async function handleEvent(event) {
         const s = await getStockByGroupSku(branch, sku);
         nb = s.box; np = s.piece;
       }
-      const { data: prodNameRow } = await supabase
+
+      // 2) 取得商品基本資料（名稱/箱入數/單價）供 GAS 計算
+      const { data: prodRow } = await supabase
         .from('products')
-        .select('貨品名稱')
+        .select('貨品名稱, 箱入數, 單價')
         .eq('貨品編號', sku)
         .maybeSingle();
-      const prodName = prodNameRow?.['貨品名稱'] || sku;
+      const prodName = prodRow?.['貨品名稱'] || sku;
+
+      // 3) 清洗成數字
+      const unitsPerBox = Number(String(prodRow?.['箱入數'] ?? '1').replace(/[^\d]/g, '')) || 1;
+      const unitPrice   = Number(String(prodRow?.['單價']   ?? '0').replace(/[^0-9.]/g, '')) || 0;
+
+      // 4) 金額（跟 Apps Script / RPC 同邏輯）
+      const deltaPiecesAbs = Math.abs(deltaBox) * unitsPerBox + Math.abs(deltaPiece);
+      const outAmount = (deltaBox < 0 || deltaPiece < 0) ? deltaPiecesAbs * unitPrice : 0;
+      const inAmount  = (deltaBox > 0 || deltaPiece > 0) ? deltaPiecesAbs * unitPrice : 0;
+      const stockAmount = (nb * unitsPerBox + np) * unitPrice;
+
+      // 5) 立即推送到 GAS（★ 即時）
+      const payload = {
+        type: 'log',
+        group: String(branch || '').trim().toLowerCase(), // 對上 BRANCH_SHEET_MAP key
+        sku,
+        name: prodName,
+        units_per_box: unitsPerBox,
+        unit_price: unitPrice,
+        in_box: Math.max(deltaBox, 0),
+        in_piece: Math.max(deltaPiece, 0),
+        out_box: Math.max(-deltaBox, 0),
+        out_piece: Math.max(-deltaPiece, 0),
+        stock_box: nb,
+        stock_piece: np,
+        out_amount: outAmount,
+        stock_amount: stockAmount,
+        created_at: formatTpeIso(new Date()) // 以台北時間 +08:00，便於 GAS 做 05:00 分界
+      };
+      postInventoryToGAS(payload).catch(()=>{ /* 忽略錯誤，不影響回覆 */ });
+
+      // 6) LINE 回覆
       await replyText(`${parsed.action === 'in' ? '✅ 入庫成功' : '✅ 出庫成功'}\n貨品名稱 📄：${prodName}\n目前庫存：${nb}箱${np}散`);
       return;
     } catch (err) {
