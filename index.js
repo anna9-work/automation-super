@@ -10,9 +10,8 @@ const {
   SUPABASE_URL,
   SUPABASE_SERVICE_ROLE_KEY,
   DEFAULT_GROUP = 'default',
-  // ★ 新增：GAS Webhook
-  GAS_WEBHOOK_URL,          // 例： https://script.google.com/macros/s/AKfycbzmag_sI_UBSTylPqU_SyLbuKacmI4Xy4X_Aftdf85_7Og7lq_Byykrm47gSjuu84HqNQ/exec
-  GAS_WEBHOOK_SECRET        // 要跟 Apps Script Script Properties 的 WEBHOOK_SECRET 一致
+  GAS_WEBHOOK_URL,
+  GAS_WEBHOOK_SECRET
 } = process.env;
 
 if (!LINE_CHANNEL_ACCESS_TOKEN || !LINE_CHANNEL_SECRET) {
@@ -256,13 +255,12 @@ async function changeInventoryByGroupSku(branch, sku, deltaBox, deltaPiece, line
 
 /** ★ 格式化成台北時區 +08:00 的 ISO（供 GAS 5:00 分界使用） */
 function formatTpeIso(date = new Date()) {
-  // 取 Asia/Taipei 的本地時間字串「YYYY-MM-DD HH:mm:ss」
   const s = new Intl.DateTimeFormat('sv-SE', {
     timeZone: 'Asia/Taipei',
     year: 'numeric', month: '2-digit', day: '2-digit',
     hour: '2-digit', minute: '2-digit', second: '2-digit',
     hour12: false
-  }).format(date); // 例如 "2025-10-02 14:23:45"
+  }).format(date);
   return s.replace(' ', 'T') + '+08:00';
 }
 
@@ -277,7 +275,7 @@ async function postInventoryToGAS(payload) {
       body: JSON.stringify(payload)
     });
     if (!res.ok) {
-      const txt = await res.text().catch(()=>'');
+      const txt = await res.text().catch(()=> '');
       console.warn('[GAS PUSH WARN]', res.status, txt);
     }
   } catch (e) {
@@ -413,7 +411,6 @@ async function handleEvent(event) {
     const deltaPiece = parsed.action === 'in' ? parsed.piece : -parsed.piece;
 
     try {
-      // 1) 先變更庫存（拿到新庫存）
       const r = await changeInventoryByGroupSku(branch, sku, deltaBox, deltaPiece, lineUserId, 'LINE');
       let nb = null, np = null;
       if (r && typeof r.new_box === 'number') nb = r.new_box;
@@ -423,7 +420,6 @@ async function handleEvent(event) {
         nb = s.box; np = s.piece;
       }
 
-      // 2) 取得商品基本資料（名稱/箱入數/單價）供 GAS 計算
       const { data: prodRow } = await supabase
         .from('products')
         .select('貨品名稱, 箱入數, 單價')
@@ -431,20 +427,20 @@ async function handleEvent(event) {
         .maybeSingle();
       const prodName = prodRow?.['貨品名稱'] || sku;
 
-      // 3) 清洗成數字
       const unitsPerBox = Number(String(prodRow?.['箱入數'] ?? '1').replace(/[^\d]/g, '')) || 1;
       const unitPrice   = Number(String(prodRow?.['單價']   ?? '0').replace(/[^0-9.]/g, '')) || 0;
 
-      // 4) 金額（跟 Apps Script / RPC 同邏輯）
       const deltaPiecesAbs = Math.abs(deltaBox) * unitsPerBox + Math.abs(deltaPiece);
       const outAmount = (deltaBox < 0 || deltaPiece < 0) ? deltaPiecesAbs * unitPrice : 0;
-      const inAmount  = (deltaBox > 0 || deltaPiece > 0) ? deltaPiecesAbs * unitPrice : 0;
+      const inAmount  = (deltaBox > 0 || deltaPiece > 0) ? deltaPiecesAbs * unitPrice : 0; // 保留變數（未用）
       const stockAmount = (nb * unitsPerBox + np) * unitPrice;
 
-      // 5) 立即推送到 GAS（★ 即時）
+      // ★ 倉庫別：目前尚未由指令提供，先送「未指定」
+      const warehouse = '未指定';
+
       const payload = {
         type: 'log',
-        group: String(branch || '').trim().toLowerCase(), // 對上 BRANCH_SHEET_MAP key
+        group: String(branch || '').trim().toLowerCase(),
         sku,
         name: prodName,
         units_per_box: unitsPerBox,
@@ -457,12 +453,12 @@ async function handleEvent(event) {
         stock_piece: np,
         out_amount: outAmount,
         stock_amount: stockAmount,
-        created_at: formatTpeIso(new Date()) // 以台北時間 +08:00，便於 GAS 做 05:00 分界
+        warehouse, // ★ 新增：倉庫別
+        created_at: formatTpeIso(new Date())
       };
-      postInventoryToGAS(payload).catch(()=>{ /* 忽略錯誤，不影響回覆 */ });
+      postInventoryToGAS(payload).catch(()=>{});
 
-      // 6) LINE 回覆
-      await replyText(`${parsed.action === 'in' ? '✅ 入庫成功' : '✅ 出庫成功'}\n貨品名稱 📄：${prodName}\n目前庫存：${nb}箱${np}散`);
+      await replyText(`${parsed.action === 'in' ? '✅ 入庫成功' : '✅ 出庫成功'}\n貨品名稱 📄：${prodName}\n倉庫別 🏷：${warehouse}\n目前庫存：${nb}箱${np}散`);
       return;
     } catch (err) {
       console.error('change error:', err);
