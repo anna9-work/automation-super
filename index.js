@@ -11,8 +11,8 @@ const {
   SUPABASE_URL,
   SUPABASE_SERVICE_ROLE_KEY,
   DEFAULT_GROUP = 'default',
-  GAS_WEBHOOK_URL: ENV_GAS_URL,      // 可缺，會自動從 app.app_settings 補
-  GAS_WEBHOOK_SECRET: ENV_GAS_SECRET // 可缺，會自動從 app.app_settings 補
+  GAS_WEBHOOK_URL: ENV_GAS_URL,      // 可缺，會自動從 DB RPC 補
+  GAS_WEBHOOK_SECRET: ENV_GAS_SECRET // 可缺，會自動從 DB RPC 補
 } = process.env;
 
 /** =================== 初始化 =================== */
@@ -29,23 +29,20 @@ app.use(express.json());
 const client = new line.Client({ channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN });
 const supabase = createClient(SUPABASE_URL.replace(/\/+$/, ''), SUPABASE_SERVICE_ROLE_KEY);
 
-/** =================== GAS 設定自動載入/快取 =================== */
+/** =================== GAS 設定自動載入/快取（改用 public RPC） =================== */
 let GAS_URL_CACHE = (ENV_GAS_URL || '').trim();
 let GAS_SECRET_CACHE = (ENV_GAS_SECRET || '').trim();
 let GAS_LOADED_ONCE = false;
 
-/** 從 app.app_settings 載入 gas_webhook_url / gas_webhook_secret */
 async function loadGasConfigFromDBIfNeeded() {
   if (GAS_URL_CACHE && GAS_SECRET_CACHE) {
     GAS_LOADED_ONCE = true;
     return;
   }
   try {
+    // 改用 RPC：public.get_app_settings(keys text[])
     const { data, error } = await supabase
-      .schema('app')
-      .from('app_settings')
-      .select('key, value')
-      .in('key', ['gas_webhook_url', 'gas_webhook_secret']);
+      .rpc('get_app_settings', { keys: ['gas_webhook_url', 'gas_webhook_secret'] });
 
     if (error) throw error;
 
@@ -60,13 +57,13 @@ async function loadGasConfigFromDBIfNeeded() {
 
     GAS_LOADED_ONCE = true;
     if (GAS_URL_CACHE && GAS_SECRET_CACHE) {
-      console.log('✅ GAS Webhook 設定已載入（app.app_settings）');
+      console.log('✅ GAS Webhook 設定已載入（public RPC）');
     } else {
       console.warn('⚠️ GAS Webhook 設定缺少（可設定環境變數或 app.app_settings）');
     }
   } catch (e) {
     GAS_LOADED_ONCE = true;
-    console.warn('⚠️ 載入 GAS 設定失敗（app.app_settings）：', e?.message || e);
+    console.warn('⚠️ 載入 GAS 設定失敗（RPC get_app_settings）：', e?.message || e);
   }
 }
 
@@ -327,5 +324,5 @@ app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`   - LINE bot: ${LINE_CHANNEL_ACCESS_TOKEN ? 'OK' : 'MISSING'}`);
   console.log(`   - Supabase: ${SUPABASE_URL ? 'OK' : 'MISSING'}`);
-  console.log(`   - GAS Webhook: ${(ENV_GAS_URL && ENV_GAS_SECRET) ? 'ENV' : 'auto-load from app.app_settings'}`);
+  console.log(`   - GAS Webhook: ${(ENV_GAS_URL && ENV_GAS_SECRET) ? 'ENV' : 'auto-load via public RPC get_app_settings'}`);
 });
