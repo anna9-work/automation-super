@@ -3,6 +3,7 @@ import express from 'express';
 import line from '@line/bot-sdk';
 import { createClient } from '@supabase/supabase-js';
 
+/** =================== 環境變數 =================== */
 const {
   PORT = 3000,
   LINE_CHANNEL_ACCESS_TOKEN,
@@ -10,18 +11,16 @@ const {
   SUPABASE_URL,
   SUPABASE_SERVICE_ROLE_KEY,
   DEFAULT_GROUP = 'default',
-  GAS_WEBHOOK_URL,          // https://script.google.com/macros/s/XXX/exec
-  GAS_WEBHOOK_SECRET        // 與 Apps Script Script Properties 的 WEBHOOK_SECRET 一致
+  GAS_WEBHOOK_URL: ENV_GAS_URL,      // 可缺，會自動從 app.app_settings 補
+  GAS_WEBHOOK_SECRET: ENV_GAS_SECRET // 可缺，會自動從 app.app_settings 補
 } = process.env;
 
+/** =================== 初始化 =================== */
 if (!LINE_CHANNEL_ACCESS_TOKEN || !LINE_CHANNEL_SECRET) {
-  console.error('缺少 LINE 環境變數');
+  console.error('⚠️ 缺少 LINE 環境變數 (CHANNEL_ACCESS_TOKEN / CHANNEL_SECRET)');
 }
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.error('缺少 Supabase 環境變數 (URL / SERVICE_ROLE_KEY)');
-}
-if (!GAS_WEBHOOK_URL || !GAS_WEBHOOK_SECRET) {
-  console.error('缺少 GAS_WEBHOOK_URL / GAS_WEBHOOK_SECRET（即時推送到試算表會失效）');
+  console.error('⛔️ 缺少 Supabase 環境變數 (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY)');
 }
 
 const app = express();
@@ -30,7 +29,59 @@ app.use(express.json());
 const client = new line.Client({ channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN });
 const supabase = createClient(SUPABASE_URL.replace(/\/+$/, ''), SUPABASE_SERVICE_ROLE_KEY);
 
-/** 共用：台北時區 ISO（+08:00） */
+/** =================== GAS 設定自動載入/快取 =================== */
+let GAS_URL_CACHE = (ENV_GAS_URL || '').trim();
+let GAS_SECRET_CACHE = (ENV_GAS_SECRET || '').trim();
+let GAS_LOADED_ONCE = false;
+
+/** 從 app.app_settings 載入 gas_webhook_url / gas_webhook_secret */
+async function loadGasConfigFromDBIfNeeded() {
+  if (GAS_URL_CACHE && GAS_SECRET_CACHE) {
+    GAS_LOADED_ONCE = true;
+    return;
+  }
+  try {
+    const { data, error } = await supabase
+      .schema('app')
+      .from('app_settings')
+      .select('key, value')
+      .in('key', ['gas_webhook_url', 'gas_webhook_secret']);
+
+    if (error) throw error;
+
+    if (Array.isArray(data)) {
+      for (const row of data) {
+        const k = String(row.key || '').trim();
+        const v = String(row.value || '').trim();
+        if (k === 'gas_webhook_url' && v) GAS_URL_CACHE = v;
+        if (k === 'gas_webhook_secret' && v) GAS_SECRET_CACHE = v;
+      }
+    }
+
+    GAS_LOADED_ONCE = true;
+    if (GAS_URL_CACHE && GAS_SECRET_CACHE) {
+      console.log('✅ GAS Webhook 設定已載入（app.app_settings）');
+    } else {
+      console.warn('⚠️ GAS Webhook 設定缺少（可設定環境變數或 app.app_settings）');
+    }
+  } catch (e) {
+    GAS_LOADED_ONCE = true;
+    console.warn('⚠️ 載入 GAS 設定失敗（app.app_settings）：', e?.message || e);
+  }
+}
+
+/** 啟動時先嘗試載入一次（不阻塞啟動） */
+loadGasConfigFromDBIfNeeded().catch(() => {});
+
+/** 取得目前有效的 GAS 設定（必要時再嘗試補載一次） */
+async function getGasConfig() {
+  if (!GAS_LOADED_ONCE || !GAS_URL_CACHE || !GAS_SECRET_CACHE) {
+    await loadGasConfigFromDBIfNeeded();
+  }
+  return { url: GAS_URL_CACHE, secret: GAS_SECRET_CACHE };
+}
+
+/** 台北時區 ISO（+08:00） */
 function formatTpeIso(date = new Date()) {
   const s = new Intl.DateTimeFormat('sv-SE', {
     timeZone: 'Asia/Taipei',
@@ -41,12 +92,20 @@ function formatTpeIso(date = new Date()) {
   return s.replace(' ', 'T') + '+08:00';
 }
 
-/** 共用：推送 GAS */
+/** 推送 GAS（缺設定就跳過並告警一次） */
+let GAS_WARNED_MISSING = false;
 async function postInventoryToGAS(payload) {
-  if (!GAS_WEBHOOK_URL || !GAS_WEBHOOK_SECRET) return;
-  const url = `${GAS_WEBHOOK_URL.replace(/\?+.*/, '')}?secret=${encodeURIComponent(GAS_WEBHOOK_SECRET)}`;
+  const { url, secret } = await getGasConfig();
+  if (!url || !secret) {
+    if (!GAS_WARNED_MISSING) {
+      console.warn('⚠️ GAS_WEBHOOK_URL / GAS_WEBHOOK_SECRET 未設定（已略過推送到試算表）');
+      GAS_WARNED_MISSING = true;
+    }
+    return;
+  }
+  const callUrl = `${url.replace(/\?+.*/, '')}?secret=${encodeURIComponent(secret)}`;
   try {
-    const res = await fetch(url, {
+    const res = await fetch(callUrl, {
       method: 'POST',
       headers: { 'Content-Type':'application/json' },
       body: JSON.stringify(payload)
@@ -58,6 +117,21 @@ async function postInventoryToGAS(payload) {
   } catch (e) {
     console.warn('[GAS PUSH ERROR]', e);
   }
+}
+
+/** 依 LINE userId 找 auth uuid（舊 LINE 流程仍需） */
+async function resolveAuthUuidFromLineUserId(lineUserId) {
+  if (!lineUserId) return null;
+  const { data, error } = await supabase
+    .from('line_user_map')
+    .select('auth_user_id')
+    .eq('line_user_id', lineUserId)
+    .maybeSingle();
+  if (error) {
+    console.warn('[resolveAuthUuid] line_user_map error:', error);
+    return null;
+  }
+  return data?.auth_user_id || null;
 }
 
 /** 共用：查 group(分店代號小寫) 與 branch_id */
@@ -110,21 +184,6 @@ async function getStockByGroupSku(group, sku) {
     box: Number(data?.['庫存箱數'] ?? 0),
     piece: Number(data?.['庫存散數'] ?? 0),
   };
-}
-
-/** 依 LINE userId 找 auth uuid（舊 LINE 流程仍需） */
-async function resolveAuthUuidFromLineUserId(lineUserId) {
-  if (!lineUserId) return null;
-  const { data, error } = await supabase
-    .from('line_user_map')
-    .select('auth_user_id')
-    .eq('line_user_id', lineUserId)
-    .maybeSingle();
-  if (error) {
-    console.warn('[resolveAuthUuid] line_user_map error:', error);
-    return null;
-  }
-  return data?.auth_user_id || null;
 }
 
 /** =========================
@@ -260,13 +319,13 @@ app.post('/app/inbound', async (req, res) => {
   }
 });
 
-/** ========= 既有 LINE webhook 區塊（原封不動，略） =========
- *  如果你需要我把整段 LINE webhook 也一起貼回來，說一聲我補完整檔。
- *  這裡保留健康檢查與啟動。
- */
+/** ========= 健康檢查 ========= */
 app.get('/health', (_req, res) => res.status(200).send('OK'));
 app.get('/', (_req, res) => res.status(200).send('RUNNING'));
 
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`   - LINE bot: ${LINE_CHANNEL_ACCESS_TOKEN ? 'OK' : 'MISSING'}`);
+  console.log(`   - Supabase: ${SUPABASE_URL ? 'OK' : 'MISSING'}`);
+  console.log(`   - GAS Webhook: ${(ENV_GAS_URL && ENV_GAS_SECRET) ? 'ENV' : 'auto-load from app.app_settings'}`);
 });
