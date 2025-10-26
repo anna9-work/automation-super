@@ -22,13 +22,14 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 }
 
 const app = express();
-// ✅ 全域請求記錄器（不讀 body，不影響簽章）
-app.use((req, res, next) => {
-  console.log(`[REQ] ${req.method} ${req.path} ua=${req.headers['user-agent'] || ''} x-line-signature=${req.headers['x-line-signature'] ? 'yes' : 'no'}`);
+
+// === 全域請求記錄器（不讀 body，不影響 LINE 簽章驗證） ===
+app.use((req, _res, next) => {
+  console.log(`[請求] ${req.method} ${req.path} ua=${req.headers['user-agent'] || ''} x-line-signature=${req.headers['x-line-signature'] ? 'yes' : 'no'}`);
   next();
 });
 
-// 只在需要的路由掛 JSON body parser，避免破壞 LINE 簽章
+// 只給需要 JSON 的路由使用，避免破壞 LINE 簽章
 const jsonParser = express.json();
 
 const supabase = createClient(SUPABASE_URL.replace(/\/+$/, ''), SUPABASE_SERVICE_ROLE_KEY);
@@ -108,25 +109,19 @@ async function postInventoryToGAS(payload) {
 
 /** ===== 共用 DB 查詢 ===== */
 async function getUserBranchAndGroup(userId) {
-  const { data: prof, error: e1 } = await supabase
-    .from('profiles').select('branch_id')
-    .eq('user_id', userId).maybeSingle();
+  const { data: prof, error: e1 } = await supabase.from('profiles').select('branch_id').eq('user_id', userId).maybeSingle();
   if (e1) throw e1;
   const branch_id = (prof?.branch_id ?? null);
   if (!branch_id) throw new Error('找不到使用者分店設定');
 
-  const { data: br, error: e2 } = await supabase
-    .from('branches').select('分店代號')
-    .eq('id', branch_id).maybeSingle();
+  const { data: br, error: e2 } = await supabase.from('branches').select('分店代號').eq('id', branch_id).maybeSingle();
   if (e2) throw e2;
   const code = (br?.['分店代號'] || '').toString().trim();
   if (!code) throw new Error('分店缺少分店代號');
   return { branch_id, group: code.toLowerCase() };
 }
 async function getProductBasic(sku) {
-  const { data, error } = await supabase
-    .from('products').select('貨品名稱, 箱入數, 單價')
-    .eq('貨品編號', sku).maybeSingle();
+  const { data, error } = await supabase.from('products').select('貨品名稱, 箱入數, 單價').eq('貨品編號', sku).maybeSingle();
   if (error) throw error;
   if (!data) throw new Error(`找不到商品：${sku}`);
   const name = data['貨品名稱'] || sku;
@@ -135,9 +130,7 @@ async function getProductBasic(sku) {
   return { name, units_per_box, unit_price_ref };
 }
 async function getStockByGroupSku(group, sku) {
-  const { data, error } = await supabase
-    .from('inventory').select('庫存箱數, 庫存散數')
-    .eq('群組', group).eq('貨品編號', sku).maybeSingle();
+  const { data, error } = await supabase.from('inventory').select('庫存箱數, 庫存散數').eq('群組', group).eq('貨品編號', sku).maybeSingle();
   if (error) throw error;
   return { box: Number(data?.['庫存箱數'] ?? 0), piece: Number(data?.['庫存散數'] ?? 0) };
 }
@@ -154,9 +147,7 @@ app.post('/app/inbound', jsonParser, async (req, res) => {
     if (authErr || !userRes?.user?.id) return res.status(401).json({ error: 'INVALID_TOKEN' });
     const userId = userRes.user.id;
 
-    const {
-      product_sku, in_box = 0, in_piece = 0, unit_cost_piece, warehouse_code = '未指定'
-    } = req.body || {};
+    const { product_sku, in_box = 0, in_piece = 0, unit_cost_piece, warehouse_code = '未指定' } = req.body || {};
     const sku = String(product_sku || '').trim().toUpperCase();
     if (!sku) return res.status(400).json({ error: 'SKU_REQUIRED' });
 
@@ -211,24 +202,31 @@ app.post('/app/inbound', jsonParser, async (req, res) => {
   }
 });
 
-/** ===== LINE webhook（不要掛任何 body parser！） ===== */
+/** ===== LINE webhook（同時支援 /webhook 與 /line/webhook；不要掛任何 body parser！） ===== */
 const lineConfig = { channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN, channelSecret: LINE_CHANNEL_SECRET };
 const lineClient = new line.Client({ channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN });
 
-// 讓 LINE 的 Verify 可以打 GET（只回 200）
+function lineWebhookHandler(req, res) {
+  (async () => {
+    try {
+      const events = req.body.events || [];
+      if (events.length) console.log(`[LINE] received ${events.length} event(s)`);
+      await Promise.all(events.map(handleLineEvent));
+      res.status(200).end();
+    } catch (err) {
+      console.error('[LINE WEBHOOK HANDLER ERROR]', err);
+      res.status(500).end();
+    }
+  })();
+}
+
+// LINE Verify 會用 GET，兩條路徑都給 200
+app.get('/webhook', (_req, res) => res.status(200).send('OK'));
 app.get('/line/webhook', (_req, res) => res.status(200).send('OK'));
 
-app.post('/line/webhook', line.middleware(lineConfig), async (req, res) => {
-  try {
-    const events = req.body.events || [];
-    if (events.length) console.log(`[LINE] received ${events.length} event(s)`);
-    await Promise.all(events.map(handleLineEvent));
-    return res.status(200).end();
-  } catch (err) {
-    console.error('[LINE WEBHOOK HANDLER ERROR]', err);
-    return res.status(500).end();
-  }
-});
+// 真正處理事件：兩條路徑都掛 line.middleware
+app.post('/webhook',       line.middleware(lineConfig), lineWebhookHandler);
+app.post('/line/webhook',  line.middleware(lineConfig), lineWebhookHandler);
 
 async function handleLineEvent(event) {
   try {
@@ -244,6 +242,7 @@ async function handleLineEvent(event) {
       if (text.toLowerCase() === 'ping') {
         return lineClient.replyMessage(event.replyToken, { type: 'text', text: 'pong' });
       }
+      // 簡單回聲
       return lineClient.replyMessage(event.replyToken, { type: 'text', text: `收到：${text}` });
     }
     return Promise.resolve();
@@ -252,18 +251,18 @@ async function handleLineEvent(event) {
     return Promise.resolve();
   }
 }
-// 簽章錯誤等會進這裡
+
+// 簽章錯誤等會進這裡（例如用 curl 直接 POST /webhook）
 app.use((err, req, res, next) => {
-  if (req.path === '/line/webhook') {
+  if (req.path === '/webhook' || req.path === '/line/webhook') {
     console.error('[LINE MIDDLEWARE ERROR]', err?.message || err);
     return res.status(400).end();
   }
   return next(err);
 });
 
-/** ===== 健康檢查 & Debug Echo ===== */
+/** ===== 健康檢查與 Debug ===== */
 app.get('/health', (_req, res) => res.status(200).send('OK'));
-// 這條可自測 POST 是否能進到容器
 app.post('/debug/echo', jsonParser, (req, res) => {
   console.log('[DEBUG ECHO]', { headers: req.headers, body: req.body });
   res.json({ ok: true, headers: req.headers, body: req.body });
@@ -271,8 +270,8 @@ app.post('/debug/echo', jsonParser, (req, res) => {
 
 /** ===== 啟動 ===== */
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`   - LINE bot: ${LINE_CHANNEL_ACCESS_TOKEN && LINE_CHANNEL_SECRET ? 'OK' : 'MISSING'}`);
-  console.log(`   - Supabase: ${SUPABASE_URL ? 'OK' : 'MISSING'}`);
-  console.log(`   - GAS Webhook: ${(ENV_GAS_URL && ENV_GAS_SECRET) ? 'ENV' : 'auto-load via public RPC get_app_settings'}`);
+  console.log(`🚀 伺服器在連接埠 ${PORT} 上運行`);
+  console.log(`   - LINE 機器人：${LINE_CHANNEL_ACCESS_TOKEN && LINE_CHANNEL_SECRET ? '好的' : '缺設定'}`);
+  console.log(`   - Supabase：${SUPABASE_URL ? '好的' : '缺設定'}`);
+  console.log(`   - GAS Webhook：${(ENV_GAS_URL && ENV_GAS_SECRET) ? 'ENV' : '透過公用 RPC get_app_settings 自動載入'}`);
 });
