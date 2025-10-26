@@ -85,9 +85,6 @@ function parseCommand(text) {
 /** 解析分店與角色 */
 async function resolveBranchAndRole(event) {
   const source = event.source || {};
-  theUser: {
-    // no-op, just a scope label for readability
-  }
   const userId = source.userId || null;
   const isGroup = source.type === 'group';
   const groupId = isGroup ? source.groupId : null;
@@ -243,24 +240,6 @@ async function getLastSku(lineUserId, branch) {
     .maybeSingle();
   if (error) throw error;
   return data?.['貨品編號'] || null;
-}
-
-/** ===== 倉庫別 → kind_name 對應 ===== */
-async function resolveWarehouseKindName(code) {
-  const c = String(code || '').trim();
-  if (!c || c === '未指定') return '未指定';
-  // 先查 warehouse_kinds（你提供的表）
-  const { data, error } = await supabase
-    .from('warehouse_kinds')
-    .select('kind_name, is_active')
-    .eq('倉庫別', c)
-    .maybeSingle();
-  if (!error && data && (data.is_active === null || data.is_active === true)) {
-    const name = (data.kind_name || '').toString().trim();
-    if (name) return name;
-  }
-  // 回退：直接用 code
-  return c;
 }
 
 /** RPC：變更庫存（LINE userId 先轉 auth uuid） */
@@ -462,9 +441,6 @@ async function handleEvent(event) {
     if (role === 'user' && s.box === 0 && s.piece === 0) { await replyText('無此商品庫存'); return; }
     await upsertUserLastProduct(lineUserId, branch, sku);
     const boxSize = p['箱入數'] ?? '-';
-    thePrice: {
-      // keep naming style with your original code style
-    }
     const price = p['單價'] ?? '-';
     await replyText(`名稱：${p['貨品名稱']}\n編號：${sku}\n箱入數：${boxSize}\n單價：${price}\n庫存：${s.box}箱${s.piece}散`);
     return;
@@ -513,6 +489,7 @@ async function handleEvent(event) {
     const deltaPiece = parsed.action === 'in' ? parsed.piece : -parsed.piece;
 
     try {
+      // 1) 先變更庫存（拿到新庫存）
       const r = await changeInventoryByGroupSku(branch, sku, deltaBox, deltaPiece, lineUserId, 'LINE');
       let nb = null, np = null;
       if (r && typeof r.new_box === 'number') nb = r.new_box;
@@ -522,6 +499,7 @@ async function handleEvent(event) {
         nb = s.box; np = s.piece;
       }
 
+      // 2) 取得商品基本資料（名稱/箱入數/單價）供 GAS 計算
       const { data: prodRow } = await supabase
         .from('products')
         .select('貨品名稱, 箱入數, 單價')
@@ -529,16 +507,20 @@ async function handleEvent(event) {
         .maybeSingle();
       const prodName = prodRow?.['貨品名稱'] || sku;
 
+      // 3) 清洗成數字
       const unitsPerBox = Number(String(prodRow?.['箱入數'] ?? '1').replace(/[^\d]/g, '')) || 1;
       const unitPrice   = Number(String(prodRow?.['單價']   ?? '0').replace(/[^0-9.]/g, '')) || 0;
 
+      // 4) 金額（跟 Apps Script / RPC 同邏輯）
       const deltaPiecesAbs = Math.abs(deltaBox) * unitsPerBox + Math.abs(deltaPiece);
       const outAmount = (deltaBox < 0 || deltaPiece < 0) ? deltaPiecesAbs * unitPrice : 0;
+      const inAmount  = (deltaBox > 0 || deltaPiece > 0) ? deltaPiecesAbs * unitPrice : 0; // 保留計算（若需）
       const stockAmount = (nb * unitsPerBox + np) * unitPrice;
 
+      // 5) 立即推送到 GAS（★ 即時）
       const payload = {
         type: 'log',
-        group: String(branch || '').trim().toLowerCase(),
+        group: String(branch || '').trim().toLowerCase(), // 對上 BRANCH_SHEET_MAP key
         sku,
         name: prodName,
         units_per_box: unitsPerBox,
@@ -551,10 +533,11 @@ async function handleEvent(event) {
         stock_piece: np,
         out_amount: outAmount,
         stock_amount: stockAmount,
-        created_at: formatTpeIso(new Date())
+        created_at: formatTpeIso(new Date()) // 以台北時間 +08:00，便於 GAS 做 05:00 分界
       };
-      postInventoryToGAS(payload).catch(()=>{});
+      postInventoryToGAS(payload).catch(()=>{ /* 忽略錯誤，不影響回覆 */ });
 
+      // 6) LINE 回覆
       await replyText(`${parsed.action === 'in' ? '✅ 入庫成功' : '✅ 出庫成功'}\n貨品名稱 📄：${prodName}\n目前庫存：${nb}箱${np}散`);
       return;
     } catch (err) {
@@ -565,163 +548,6 @@ async function handleEvent(event) {
   }
   return;
 }
-
-/** ===== App 入庫（只對這條掛 jsonParser） =====
- *  🔴 重點：payload.warehouse 會送「kind_name」而非「倉庫別(code)」
- */
-app.post('/app/inbound', jsonParser, async (req, res) => {
-  try {
-    const authz = req.headers.authorization || '';
-    const m = authz.match(/^Bearer\s+(.+)$/i);
-    if (!m) return res.status(401).json({ error: 'NO_AUTH' });
-    const accessToken = m[1];
-
-    // 驗證使用者
-    const { data: userRes, error: authErr } = await supabase.auth.getUser(accessToken);
-    if (authErr || !userRes?.user?.id) {
-      return res.status(401).json({ error: 'INVALID_TOKEN' });
-    }
-    const userId = userRes.user.id;
-
-    // 解析 body
-    const {
-      product_sku,
-      in_box = 0,
-      in_piece = 0,
-      unit_cost_piece,         // 每件成本（必要）
-      warehouse_code = '未指定'
-    } = req.body || {};
-
-    const sku = String(product_sku || '').trim().toUpperCase();
-    if (!sku) return res.status(400).json({ error: 'SKU_REQUIRED' });
-
-    const box = Number.isFinite(+in_box) ? parseInt(in_box, 10) : 0;
-    const piece = Number.isFinite(+in_piece) ? parseInt(in_piece, 10) : 0;
-    if (box < 0 || piece < 0 || (box === 0 && piece === 0)) {
-      return res.status(400).json({ error: 'INVALID_QTY' });
-    }
-
-    const unitCost = Number(unit_cost_piece);
-    if (!Number.isFinite(unitCost) || unitCost < 0) {
-      return res.status(400).json({ error: 'INVALID_UNIT_COST' });
-    }
-
-    // 取得分店與群組
-    const { branch_id, group } = await (async () => {
-      const { data: prof, error: e1 } = await supabase
-        .from('profiles').select('branch_id').eq('user_id', userId).maybeSingle();
-      if (e1) throw e1;
-      const branch_id = (prof?.branch_id ?? null);
-      if (!branch_id) throw new Error('找不到使用者分店設定');
-
-      const { data: br, error: e2 } = await supabase
-        .from('branches').select('分店代號').eq('id', branch_id).maybeSingle();
-      if (e2) throw e2;
-      const code = (br?.['分店代號'] || '').toString().trim();
-      if (!code) throw new Error('分店缺少分店代號');
-      return { branch_id, group: code.toLowerCase() };
-    })();
-
-    // 商品資訊
-    const { data: prod, error: prodErr } = await supabase
-      .from('products')
-      .select('貨品名稱, 箱入數, 單價')
-      .eq('貨品編號', sku)
-      .maybeSingle();
-    if (prodErr) throw prodErr;
-    if (!prod) throw new Error(`找不到商品：${sku}`);
-    const name = prod['貨品名稱'] || sku;
-    const units_per_box = Number(String(prod['箱入數'] ?? '1').replace(/[^\d]/g, '')) || 1;
-
-    // 變動庫存
-    const { error: changeErr } = await supabase.rpc('exec_change_inventory_by_group_sku', {
-      p_group: group,
-      p_sku: sku,
-      p_delta_box: box,
-      p_delta_piece: piece,
-      p_user_id: userId,
-      p_source: 'APP'
-    });
-    if (changeErr) throw changeErr;
-
-    // 寫入 lots（帶 warehouse_code）
-    const totalPieces = (box * units_per_box) + piece;
-    const nowIso = new Date().toISOString();
-    try {
-      await supabase.from('inventory_lots').insert({
-        branch_id,
-        product_sku: sku,
-        uom: 'piece',
-        qty_in: totalPieces,
-        unit_cost: unitCost,
-        created_at: nowIso,
-        created_by: userRes.user.email || userId,
-        warehouse_code: warehouse_code,
-      });
-    } catch {
-      await supabase.from('inventory_lots').insert({
-        branch_id,
-        product_sku: sku,
-        uom: 'piece',
-        qty_in: totalPieces,
-        unit_cost: unitCost,
-        created_at: nowIso,
-        created_by: userRes.user.email || userId,
-      });
-    }
-
-    // 讀現量
-    const { data: invRow, error: invErr } = await supabase
-      .from('inventory')
-      .select('庫存箱數, 庫存散數')
-      .eq('群組', group)
-      .eq('貨品編號', sku)
-      .maybeSingle();
-    if (invErr) throw invErr;
-    const stock_box = Number(invRow?.['庫存箱數'] ?? 0);
-    const stock_piece = Number(invRow?.['庫存散數'] ?? 0);
-
-    // ★ 倉庫別轉 kind_name 供 GAS 顯示
-    const warehouse_display = await resolveWarehouseKindName(warehouse_code);
-
-    // 推 GAS（05:00 分界靠 GAS 端處理）
-    const unitPrice = unitCost;
-    const outAmount = 0;
-    const stockAmount = (stock_box * units_per_box + stock_piece) * unitPrice;
-    const payload = {
-      type: 'log',
-      group,
-      sku,
-      name,
-      units_per_box,
-      unit_price: unitPrice,
-      in_box: box,
-      in_piece: piece,
-      out_box: 0,
-      out_piece: 0,
-      stock_box,
-      stock_piece,
-      out_amount: outAmount,
-      stock_amount: stockAmount,
-      warehouse: warehouse_display, // ★ 改成傳 kind_name
-      created_at: formatTpeIso(new Date())
-    };
-    postInventoryToGAS(payload).catch(()=>{});
-
-    return res.json({
-      ok: true,
-      sku,
-      name,
-      units_per_box,
-      stock_box,
-      stock_piece,
-      warehouse_display
-    });
-  } catch (e) {
-    console.error('[APP INBOUND ERROR]', e);
-    return res.status(500).json({ error: e?.message || 'SERVER_ERROR' });
-  }
-});
 
 /** 你若還有其它自訂 API，要用 JSON，像下面這樣掛 parser： */
 // app.post('/some/api', jsonParser, async (req, res) => { /* ... */ });
