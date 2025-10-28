@@ -57,7 +57,7 @@ async function getBranchIdByGroupCode(groupCode) {
   return data?.id ?? null;
 }
 
-/** 指令解析（支援 @倉庫 或 (倉庫=xxx)） */
+/** 指令解析（支援舊版「出1」尾數，並保留 @倉庫 / (倉庫=xxx)） */
 function parseCommand(text) {
   const t = (text || '').trim();
   if (!/^(查|查詢|條碼|編號|#|入庫|入|出庫|出)/.test(t)) return null;
@@ -73,17 +73,24 @@ function parseCommand(text) {
   const mQuery = t.match(/^查(?:詢)?\s*(.+)$/);
   if (mQuery) return { type: 'query', keyword: mQuery[1].trim() };
 
-  // 出 2箱1件、入3件、出5箱 @櫃倉、出2件(倉庫=總倉)
-  const mChange = t.match(/^(入庫|入|出庫|出)\s*(?:(\d+)\s*箱)?\s*(?:(\d+)\s*(?:個|散|件))?(?:\s*(?:@|（?\(?倉庫[:：=]\s*)([^)）]+)\)?)?\s*$/);
+  // 入/出 指令：支援
+  // 1) 入庫/入/出庫/出
+  // 2) 可寫「3箱」「2件/散/個」
+  // 3) 尾巴單獨一個數字（舊版行為：「出1」= 出1件）
+  // 4) 可帶 @倉庫 或 (倉庫=xxx) 或 （倉庫：xxx）
+  const mChange = t.match(
+    /^(入庫|入|出庫|出)\s*(?:(\d+)\s*箱)?\s*(?:(\d+)\s*(?:個|散|件))?(?:\s*(\d+))?(?:\s*(?:@|（?\(?倉庫[:：=]\s*)([^)）]+)\)?)?\s*$/
+  );
   if (mChange) {
     const box = mChange[2] ? parseInt(mChange[2], 10) : 0;
     const pieceLabeled = mChange[3] ? parseInt(mChange[3], 10) : 0;
-    const warehouse = (mChange[4] || '').trim();
+    const pieceTail = mChange[4] ? parseInt(mChange[4], 10) : 0;
+    const warehouse = (mChange[5] || '').trim();
     return {
       type: 'change',
       action: /入/.test(mChange[1]) ? 'in' : 'out',
       box,
-      piece: pieceLabeled,
+      piece: pieceLabeled || pieceTail,
       warehouse: warehouse || null
     };
   }
@@ -139,6 +146,41 @@ async function autoRegisterUser(lineUserId) {
       黑名單: false
     });
   }
+}
+
+/** ★ 補：最後選取的貨號（新版原本有呼叫，這裡補定義） */
+async function upsertUserLastProduct(lineUserId, branch, sku) {
+  if (!lineUserId) return;
+  const now = new Date().toISOString();
+  const { data } = await supabase
+    .from('user_last_product')
+    .select('id')
+    .eq('user_id', lineUserId)
+    .eq('群組', branch)
+    .maybeSingle();
+  if (data) {
+    await supabase
+      .from('user_last_product')
+      .update({ '貨品編號': sku, '建立時間': now })
+      .eq('user_id', lineUserId)
+      .eq('群組', branch);
+  } else {
+    await supabase
+      .from('user_last_product')
+      .insert({ user_id: lineUserId, 群組: branch, '貨品編號': sku, '建立時間': now });
+  }
+}
+async function getLastSku(lineUserId, branch) {
+  const { data, error } = await supabase
+    .from('user_last_product')
+    .select('貨品編號')
+    .eq('user_id', lineUserId)
+    .eq('群組', branch)
+    .order('建立時間', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  return data?.['貨品編號'] || null;
 }
 
 /** ★（沿用舊邏輯）讀 inventory 聚合表 */
@@ -375,7 +417,7 @@ async function getInStockSkuSet(branch) {
 function logEventSummary(event) {
   try {
     const src = event?.source || {};
-    const msg = event?.message || {};
+       const msg = event?.message || {};
     const isGroup = src.type === 'group';
     const isRoom = src.type === 'room';
     const groupId = isGroup ? src.groupId : null;
