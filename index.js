@@ -1,7 +1,7 @@
-require('dotenv').config();
-const express = require('express');
-const line = require('@line/bot-sdk');
-const { createClient } = require('@supabase/supabase-js');
+import 'dotenv/config';
+import express from 'express';
+import line from '@line/bot-sdk';
+import { createClient } from '@supabase/supabase-js';
 
 /** ========= ENV ========= */
 const {
@@ -40,24 +40,20 @@ function toWarehouseCn(input) {
   if (!raw) return '未指定';
   const lower = raw.toLowerCase();
 
-  // 1) code 命中
   if (WAREHOUSE_DICT[lower]) return WAREHOUSE_DICT[lower];
-
-  // 2) 已是中文，且在字典內
   if (WAREHOUSE_REVERSE[raw]) return raw;
 
-  // 3) 英文別名兜中文（保守處理）
   switch (lower) {
     case 'main': return '總倉';
     case 'agency': return '代夾物';
     case 'swap': return '夾換品';
     case 'withdraw': return '撤台';
     case 'unspecified': return '未指定';
-    default: return raw; // 不認得就保留原字
+    default: return raw;
   }
 }
 
-/** 給 FIFO / 查詢 lots 用：把中文顯示名→候選 raw（name 和 code） */
+/** 供 FIFO / lots 查詢：把中文顯示名→候選 raw（name 與 code） */
 function warehouseCandidatesFromCn(cnName) {
   const name = toWarehouseCn(cnName);
   const code = WAREHOUSE_REVERSE[name] || '';
@@ -75,7 +71,7 @@ const jsonParser = express.json();
 const client = new line.Client({ channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN });
 const supabase = createClient(SUPABASE_URL.replace(/\/+$/, ''), SUPABASE_SERVICE_ROLE_KEY);
 
-/** ========= 進程內記憶：最後選倉 ========= */
+/** ========= 進程內記憶：最後選倉（中文） ========= */
 const LAST_WAREHOUSE_BY_USER_BRANCH = new Map(); // key=`${userId}::${branch}` -> 中文倉名
 
 /** ========= LINE userId → auth.users.id (uuid) ========= */
@@ -410,7 +406,7 @@ function buildQuickReplyForWarehouses(baseText, warehouseList, wantBox, wantPiec
   return { items };
 }
 
-/** ========= FIFO 出庫（以中文倉名進，優先用中文名匹配，不行時 fallback code） ========= */
+/** ========= FIFO 出庫（以中文倉名進，優先中文，失敗再試 code） ========= */
 async function callFifoOutLots(branch, sku, uom, qty, warehouseCn, lineUserId) {
   const authUuid = await resolveAuthUuidFromLineUserId(lineUserId);
   if (!authUuid) {
@@ -420,7 +416,6 @@ async function callFifoOutLots(branch, sku, uom, qty, warehouseCn, lineUserId) {
   if (qty <= 0) return { consumed: 0, cost: 0 };
 
   const candidates = warehouseCandidatesFromCn(warehouseCn);
-  // 優先使用中文名
   const tryNames = [candidates[0], candidates[1]].filter(Boolean);
 
   let lastErr = null;
