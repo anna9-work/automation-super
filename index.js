@@ -46,7 +46,7 @@ async function resolveAuthUuidFromLineUserId(lineUserId) {
   return data?.auth_user_id || null;
 }
 
-/** ★ 取得 branches.id */
+/** 取得 branches.id */
 async function getBranchIdByGroupCode(groupCode) {
   const { data, error } = await supabase
     .from('branches')
@@ -57,7 +57,7 @@ async function getBranchIdByGroupCode(groupCode) {
   return data?.id ?? null;
 }
 
-/** 指令解析：新增「倉 XXX」選倉，並保留舊版入/出尾數與 @倉庫 */
+/** 指令解析：含「倉 XXX」選倉、@倉庫、尾數出1=1件 */
 function parseCommand(text) {
   const t = (text || '').trim();
   if (!/^(查|查詢|條碼|編號|#|入庫|入|出庫|出|倉)/.test(t)) return null;
@@ -97,7 +97,7 @@ function parseCommand(text) {
   return null;
 }
 
-/** 解析分店與角色（原樣） */
+/** 解析分店與角色 */
 async function resolveBranchAndRole(event) {
   const source = event.source || {};
   const userId = source.userId || null;
@@ -219,7 +219,7 @@ async function getWarehouseStockBySku(branch, sku) {
   if (error) throw error;
   const map = new Map(); // key = warehouse_name, value = { box, piece }
   (data || []).forEach(r => {
-    const w = String(r.warehouse_name || '未指定');
+    const w = String(r.warehouse_name || '未指定'); // 中文顯示名
     const u = String(r.uom || '').toLowerCase();
     const q = Number(r.qty_left || 0);
     if (!map.has(w)) map.set(w, { box:0, piece:0 });
@@ -251,11 +251,10 @@ async function getWarehouseStockForSku(branch, sku, warehouseName) {
   return { box, piece };
 }
 
-/** 指定倉的顯示單價（取該倉「最近仍有量」lot 的 unit_cost；找不到就用 products.單價） */
+/** 指定倉的顯示單價：取該倉「最近仍有量」lot 的 unit_cost；若無則用 products.單價 */
 async function getWarehouseDisplayUnitCost(branch, sku, warehouseName) {
   const branchId = await getBranchIdByGroupCode(branch);
   if (!branchId) return null;
-  // 先找 qty_left>0 的最新 lot
   const { data: lot, error: e1 } = await supabase
     .from('inventory_lots')
     .select('unit_cost, created_at')
@@ -267,10 +266,9 @@ async function getWarehouseDisplayUnitCost(branch, sku, warehouseName) {
     .limit(1)
     .maybeSingle();
   if (e1) throw e1;
-  if (lot && typeof lot.unit_cost !== 'undefined' && lot.unit_cost !== null) {
+  if (lot && lot.unit_cost !== null && typeof lot.unit_cost !== 'undefined') {
     return Number(lot.unit_cost);
   }
-  // 後備：抓 products.單價
   const { data: prod } = await supabase
     .from('products')
     .select('單價')
@@ -280,7 +278,7 @@ async function getWarehouseDisplayUnitCost(branch, sku, warehouseName) {
   return price;
 }
 
-/** 倉庫 quick reply（用「倉 XXX」作為回傳文字） */
+/** 倉庫 quick reply（查詢用；中文名） */
 function buildQuickReplyForWarehousesForQuery(warehouseList) {
   const items = warehouseList.slice(0, 12).map(w => {
     const label = `${w.warehouse}（${w.box}箱/${w.piece}件）`.slice(0, 20);
@@ -290,7 +288,7 @@ function buildQuickReplyForWarehousesForQuery(warehouseList) {
   return { items };
 }
 
-/** 二層倉庫 quick reply（出庫用） */
+/** 二層倉庫 quick reply（出庫用；中文名） */
 function buildQuickReplyForWarehouses(baseText, warehouseList, wantBox, wantPiece) {
   const items = warehouseList.slice(0, 12).map(w => {
     const label = `${w.warehouse}（${w.box}箱/${w.piece}散）`.slice(0, 20);
@@ -323,7 +321,7 @@ async function callFifoOutLots(branch, sku, uom, qty, warehouseName, lineUserId)
   return { consumed: Number(row?.consumed || 0), cost: Number(row?.cost || 0) };
 }
 
-/** 同步更新 inventory 聚合表 */
+/** 同步更新 inventory 聚合表（群組+SKU） */
 async function changeInventoryByGroupSku(branch, sku, deltaBox, deltaPiece, lineUserId, source = 'LINE') {
   const authUuid = await resolveAuthUuidFromLineUserId(lineUserId);
   if (!authUuid) {
@@ -523,7 +521,7 @@ app.use((err, req, res, next) => {
   return next(err);
 });
 
-/** ====== 指令主處理（含：查詢→多倉選擇→顯示倉別細節；出庫仍保留多倉必選與 FIFO 成本） ====== */
+/** ====== 指令主處理（查詢→多倉選擇→倉別資訊；出庫：多倉必選、FIFO 成本、GAS 以倉分列） ====== */
 async function handleEvent(event) {
   if (event.type !== 'message' || event.message.type !== 'text') return;
   const text = event.message.text || '';
@@ -553,7 +551,7 @@ async function handleEvent(event) {
     const sku = await getLastSku(lineUserId, branch);
     if (!sku) { await replyText('請先選擇商品（查 / 條碼 / 編號）後再選倉庫'); return; }
 
-    // 讀商品基本資料
+    // 商品基本資料
     const { data: prodRow } = await supabase
       .from('products')
       .select('貨品名稱, 箱入數')
@@ -562,7 +560,7 @@ async function handleEvent(event) {
     const prodName = prodRow?.['貨品名稱'] || sku;
     const boxSize = prodRow?.['箱入數'] ?? '-';
 
-    // 該倉的顯示單價與庫存
+    // 該倉的顯示單價與庫存（不合併）
     const wh = parsed.warehouse;
     const unitPrice = await getWarehouseDisplayUnitCost(branch, sku, wh);
     const { box, piece } = await getWarehouseStockForSku(branch, sku, wh);
@@ -592,7 +590,7 @@ async function handleEvent(event) {
     if (role === 'user' && s.box === 0 && s.piece === 0) { await replyText('無此商品庫存'); return; }
     await upsertUserLastProduct(lineUserId, branch, sku);
 
-    // 倉庫有量清單（只列有量）
+    // 倉庫有量清單（只列有量；顯示中文名）
     const whList = await getWarehouseStockBySku(branch, sku);
     if (whList.length >= 2) {
       await reply({
@@ -603,7 +601,6 @@ async function handleEvent(event) {
       return;
     }
     if (whList.length === 1) {
-      // 直接顯示該倉細節
       const wh = whList[0].warehouse;
       const unitPrice = await getWarehouseDisplayUnitCost(branch, sku, wh);
       const { box, piece } = await getWarehouseStockForSku(branch, sku, wh);
@@ -618,7 +615,6 @@ async function handleEvent(event) {
       );
       return;
     }
-    // 沒庫存
     await replyText('無此商品庫存');
     return;
   }
@@ -703,7 +699,7 @@ async function handleEvent(event) {
     return;
   }
 
-  // === 入/出庫（保留你原先的多倉必選與 FIFO 成本邏輯） ===
+  // === 入/出庫 ===
   if (parsed.type === 'change') {
     if (parsed.action === 'in' && role !== '主管') { await replyText('您無法使用「入庫」'); return; }
     if (parsed.box === 0 && parsed.piece === 0) return;
@@ -711,7 +707,7 @@ async function handleEvent(event) {
     const sku = await getLastSku(lineUserId, branch);
     if (!sku) { await replyText('請先用「查 商品」或「條碼123 / 編號ABC」選定商品後再入/出庫。'); return; }
 
-    // 出庫：多倉有量 → 強制選倉（若未帶）
+    // 出庫：多倉有量 → 未指定倉時強制選倉（顯示中文名）
     if (parsed.action === 'out' && !parsed.warehouse) {
       const list = await getWarehouseStockBySku(branch, sku);
       if (list.length >= 2) {
@@ -726,7 +722,7 @@ async function handleEvent(event) {
       if (parsed.action === 'out') {
         const wh = parsed.warehouse || '未指定';
 
-        // FIFO 成本加總
+        // 1) FIFO 扣批（分 box/piece），成本加總（供 GAS out_amount）
         let fifoCostTotal = 0;
         if (parsed.box > 0) {
           const rBox = await callFifoOutLots(branch, sku, 'box', parsed.box, wh, lineUserId);
@@ -737,7 +733,7 @@ async function handleEvent(event) {
           fifoCostTotal += Number(rPiece.cost || 0);
         }
 
-        // 同步聚合
+        // 2) 同步聚合（群組+SKU）
         await changeInventoryByGroupSku(
           branch,
           sku,
@@ -747,43 +743,47 @@ async function handleEvent(event) {
           'LINE'
         );
 
-        // 顯示 & 推送
+        // 3) 顯示/推送：以「該倉」為單位的庫存與單價（不合併）
         const { data: prodRow } = await supabase
           .from('products')
           .select('貨品名稱, 箱入數, 單價')
           .eq('貨品編號', sku)
           .maybeSingle();
         const prodName = prodRow?.['貨品名稱'] || sku;
-        const s = await getStockByGroupSku(branch, sku);
         const unitsPerBox = Number(String(prodRow?.['箱入數'] ?? '1').replace(/[^\d]/g, '')) || 1;
-        const unitPrice   = Number(String(prodRow?.['單價']   ?? '0').replace(/[^0-9.]/g, '')) || 0;
+        const sellPrice   = Number(String(prodRow?.['單價']   ?? '0').replace(/[^0-9.]/g, '')) || 0;
 
+        // 「該倉」最新庫存（出庫後）
+        const { box: whBox, piece: whPiece } = await getWarehouseStockForSku(branch, sku, wh);
+
+        // GAS：按「相同 sku × 單價 × 倉庫」分列（庫存用該倉，不用總和）
         const payload = {
           type: 'log',
           group: String(branch || '').trim().toLowerCase(),
           sku,
           name: prodName,
           units_per_box: unitsPerBox,
-          unit_price: unitPrice, // 參考
+          unit_price: sellPrice,                 // 參考售價
           in_box: 0,
           in_piece: 0,
           out_box: parsed.box,
           out_piece: parsed.piece,
-          stock_box: s.box,
-          stock_piece: s.piece,
-          out_amount: fifoCostTotal, // ★ 用 FIFO 成本
-          stock_amount: (s.box * unitsPerBox + s.piece) * unitPrice,
-          warehouse: wh,
+          stock_box: whBox,                      // ★ 用該倉庫存
+          stock_piece: whPiece,                  // ★ 用該倉庫存
+          out_amount: fifoCostTotal,             // ★ FIFO 成本合計
+          stock_amount: (whBox * unitsPerBox + whPiece) * sellPrice, // 依該倉庫存計算
+          warehouse: wh,                         // ★ 倉庫中文名稱
           created_at: formatTpeIso(new Date())
         };
         postInventoryToGAS(payload).catch(()=>{});
 
+        // 4) 回覆（以該倉庫存）
         await replyText(
           `✅ 出庫成功\n` +
           `貨品名稱：${prodName}\n` +
           `倉庫類別：${wh}\n` +
           `出庫：${parsed.box || 0}箱 ${parsed.piece || 0}件\n` +
-          `目前庫存：${s.box}箱${s.piece}散`
+          `目前庫存：${whBox}箱${whPiece}散`
         );
         return;
       }
