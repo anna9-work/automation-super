@@ -682,7 +682,6 @@ async function handleEvent(event) {
       `編號：${sku}\n` +
       `箱入數：${boxSize}\n` +
       `單價：${unitPrice}\n` +
-      `倉庫類別：${wh}\n` +
       `庫存：${box}箱${piece}散`
     );
     return;
@@ -706,7 +705,7 @@ async function handleEvent(event) {
     if (whList.length >= 2) {
       await reply({
         type: 'text',
-        text: `名稱：${p['貨品名稱']}\n編號：${sku}\n請選擇倉庫`,
+        text: `名稱：${p['貨品名稱']}\n編號：${sku}\n👉請選擇倉庫`,
         quickReply: buildQuickReplyForWarehousesForQuery(whList)
       });
       return;
@@ -745,7 +744,7 @@ async function handleEvent(event) {
     if (whList.length >= 2) {
       await reply({
         type: 'text',
-        text: `名稱：${p['貨品名稱']}\n編號：${sku}\n請選擇倉庫`,
+        text: `名稱：${p['貨品名稱']}\n編號：${sku}\n👉請選擇倉庫`,
         quickReply: buildQuickReplyForWarehousesForQuery(whList)
       });
       return;
@@ -788,7 +787,7 @@ async function handleEvent(event) {
     if (whList.length >= 2) {
       await reply({
         type: 'text',
-        text: `名稱：${p['貨品名稱']}\n編號：${sku}\n請選擇倉庫`,
+        text: `🍀品名：${p['貨品名稱']}\n編號：${sku}\n👉請選擇倉庫`,
         quickReply: buildQuickReplyForWarehousesForQuery(whList)
       });
       return;
@@ -800,7 +799,7 @@ async function handleEvent(event) {
       const { box, piece } = await getWarehouseStockForSku(branch, sku, wh);
       const boxSize = p['箱入數'] ?? '-';
       await replyText(
-        `名稱：${p['貨品名稱']}\n` +
+        `🍀品名：${p['貨品名稱']}\n` +
         `編號：${sku}\n` +
         `箱入數：${boxSize}\n` +
         `單價：${unitPrice}\n` +
@@ -906,10 +905,10 @@ async function handleEvent(event) {
 
         await replyText(
           `✅ 出庫成功\n` +
-          `貨品名稱：${prodName}\n` +
-          `倉庫類別：${wh}\n` +
+          `品名：${prodName}\n` +
+          `倉庫別：${wh}\n` +
           `出庫：${parsed.box || 0}箱 ${parsed.piece || 0}件\n` +
-          `目前庫存：${afterSnap.box}箱${afterSnap.piece}散`
+          `👉目前庫存：${afterSnap.box}箱${afterSnap.piece}散`
         );
         return;
       }
