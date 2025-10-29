@@ -1,4 +1,4 @@
-// index.js — 完整覆蓋版
+// index.js — 完整覆蓋版（只改：★1、★2，其餘不動）
 import 'dotenv/config';
 import express from 'express';
 import line from '@line/bot-sdk';
@@ -103,12 +103,14 @@ async function resolveAuthUuidFromLineUserId(lineUserId) {
   return data?.auth_user_id || null;
 }
 
-/** 取得 branches.id */
+/** 取得 branches.id — ★2：用 ilike 不分大小寫；同時 trim */
 async function getBranchIdByGroupCode(groupCode) {
+  const key = String(groupCode || '').trim();
+  if (!key) return null;
   const { data, error } = await supabase
     .from('branches')
     .select('id')
-    .eq('分店代號', groupCode)
+    .ilike('分店代號', key)   // ★ ilike：避免群組代號大小寫不一致查不到
     .maybeSingle();
   if (error) throw error;
   return data?.id ?? null;
@@ -152,7 +154,7 @@ function parseCommand(text) {
   return null;
 }
 
-/** 解析分店與角色 */
+/** 解析分店與角色 — ★1：把取到的群組代號統一轉小寫（DB 用 ilike 也能接） */
 async function resolveBranchAndRole(event) {
   const source = event.source || {};
   const userId = source.userId || null;
@@ -177,16 +179,16 @@ async function resolveBranchAndRole(event) {
       .select('群組')
       .eq('line_group_id', groupId)
       .maybeSingle();
-    const branch = lg?.群組 || null;
-    return { branch, role, blocked, needBindMsg: '此群組尚未綁定分店，請管理員設定' };
+    const branch = (lg?.群組 || null);
+    return { branch: branch ? String(branch).trim().toLowerCase() : null, role, blocked, needBindMsg: '此群組尚未綁定分店，請管理員設定' }; // ★
   } else {
     const { data: u2 } = await supabase
       .from('users')
       .select('群組')
       .eq('user_id', userId)
       .maybeSingle();
-    const branch = u2?.群組 || null;
-    return { branch, role, blocked, needBindMsg: '此使用者尚未綁定分店，請管理員設定' };
+    const branch = (u2?.群組 || null);
+    return { branch: branch ? String(branch).trim().toLowerCase() : null, role, blocked, needBindMsg: '此使用者尚未綁定分店，請管理員設定' }; // ★
   }
 }
 
