@@ -678,7 +678,7 @@ async function handleEvent(event) {
     const { box, piece } = await getWarehouseStockForSku(branch, sku, wh);
 
     await replyText(
-      `名稱：${prodName}\n` +
+      `品名：${prodName}\n` +
       `編號：${sku}\n` +
       `箱入數：${boxSize}\n` +
       `單價：${unitPrice}\n` +
@@ -906,7 +906,7 @@ async function handleEvent(event) {
         await replyText(
           `✅ 出庫成功\n` +
           `品名：${prodName}\n` +
-          `倉庫別：${wh}\n` +
+          `倉別：${wh}\n` +
           `出庫：${parsed.box || 0}箱 ${parsed.piece || 0}件\n` +
           `👉目前庫存：${afterSnap.box}箱${afterSnap.piece}散`
         );
