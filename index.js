@@ -1,4 +1,3 @@
-// index.js — 完整覆蓋版（只改：★1、★2，其餘不動）
 import 'dotenv/config';
 import express from 'express';
 import line from '@line/bot-sdk';
@@ -103,14 +102,14 @@ async function resolveAuthUuidFromLineUserId(lineUserId) {
   return data?.auth_user_id || null;
 }
 
-/** 取得 branches.id — ★2：用 ilike 不分大小寫；同時 trim */
+/** 取得 branches.id（大小寫不敏感） */
 async function getBranchIdByGroupCode(groupCode) {
   const key = String(groupCode || '').trim();
   if (!key) return null;
   const { data, error } = await supabase
     .from('branches')
     .select('id')
-    .ilike('分店代號', key)   // ★ ilike：避免群組代號大小寫不一致查不到
+    .ilike('分店代號', key)
     .maybeSingle();
   if (error) throw error;
   return data?.id ?? null;
@@ -154,7 +153,7 @@ function parseCommand(text) {
   return null;
 }
 
-/** 解析分店與角色 — ★1：把取到的群組代號統一轉小寫（DB 用 ilike 也能接） */
+/** 解析分店與角色（保持原樣大小寫，不強制 lower） */
 async function resolveBranchAndRole(event) {
   const source = event.source || {};
   const userId = source.userId || null;
@@ -179,16 +178,16 @@ async function resolveBranchAndRole(event) {
       .select('群組')
       .eq('line_group_id', groupId)
       .maybeSingle();
-    const branch = (lg?.群組 || null);
-    return { branch: branch ? String(branch).trim().toLowerCase() : null, role, blocked, needBindMsg: '此群組尚未綁定分店，請管理員設定' }; // ★
+    const branch = lg?.群組 || null;
+    return { branch, role, blocked, needBindMsg: '此群組尚未綁定分店，請管理員設定' };
   } else {
     const { data: u2 } = await supabase
       .from('users')
       .select('群組')
       .eq('user_id', userId)
       .maybeSingle();
-    const branch = (u2?.群組 || null);
-    return { branch: branch ? String(branch).trim().toLowerCase() : null, role, blocked, needBindMsg: '此使用者尚未綁定分店，請管理員設定' }; // ★
+    const branch = u2?.群組 || null;
+    return { branch, role, blocked, needBindMsg: '此使用者尚未綁定分店，請管理員設定' };
   }
 }
 
@@ -240,47 +239,39 @@ async function getLastSku(lineUserId, branch) {
   return data?.['貨品編號'] || null;
 }
 
-/** ================= 修正：聚合庫存 & 可見清單一律看 inventory_lots ================= */
-/** 聚合庫存（群組+SKU）— 改用 inventory_lots */
+/** ================== 查詢使用：沿用 1028 可用版的 inventory 聚合 ================== */
+/** 聚合庫存（群組+SKU）→ 查 inventory（與 1028 版一致） */
 async function getStockByGroupSku(branch, sku) {
-  const branchId = await getBranchIdByGroupCode(branch);
-  if (!branchId) return { box: 0, piece: 0 };
   const { data, error } = await supabase
-    .from('inventory_lots')
-    .select('uom, qty_left')
-    .eq('branch_id', branchId)
-    .eq('product_sku', skuKey(sku))
-    .gt('qty_left', 0);
+    .from('inventory')
+    .select('庫存箱數, 庫存散數')
+    .eq('群組', branch)
+    .eq('貨品編號', sku)
+    .maybeSingle();
   if (error) throw error;
-  let box = 0, piece = 0;
-  (data || []).forEach(r => {
-    const u = String(r.uom || '').toLowerCase();
-    const q = Number(r.qty_left || 0);
-    if (u === 'box') box += q;
-    else if (u === 'piece') piece += q;
-  });
-  return { box, piece };
+  return {
+    box: Number(data?.['庫存箱數'] ?? 0),
+    piece: Number(data?.['庫存散數'] ?? 0)
+  };
 }
 
-/** 取有庫存 SKU 集（一般使用者過濾）— 改用 inventory_lots（集合存 uppercase） */
+/** 取有庫存 SKU 集（一般使用者過濾）→ 查 inventory（與 1028 版一致） */
 async function getInStockSkuSet(branch) {
-  const branchId = await getBranchIdByGroupCode(branch);
-  if (!branchId) return new Set();
   const { data, error } = await supabase
-    .from('inventory_lots')
-    .select('product_sku, qty_left')
-    .eq('branch_id', branchId)
-    .gt('qty_left', 0);
+    .from('inventory')
+    .select('貨品編號, 庫存箱數, 庫存散數')
+    .eq('群組', branch);
   if (error) throw error;
   const set = new Set();
-  (data || []).forEach(r => {
-    const sku = skuKey(r.product_sku || '');
-    if (sku) set.add(sku);
+  (data || []).forEach(row => {
+    const box = Number(row['庫存箱數'] || 0);
+    const piece = Number(row['庫存散數'] || 0);
+    if (box > 0 || piece > 0) set.add(row['貨品編號']);
   });
   return set;
 }
 
-/** 產品搜尋（名稱/條碼/編號）——使用者身分以 lots 集合過濾（以 uppercase 比對） */
+/** 產品搜尋（名稱/條碼/編號）——使用者身分以 inventory 集合過濾 */
 async function searchByName(keyword, role, _branch, inStockSet) {
   const k = String(keyword || '').trim();
   const { data, error } = await supabase
@@ -290,7 +281,7 @@ async function searchByName(keyword, role, _branch, inStockSet) {
     .limit(20);
   if (error) throw error;
   let list = data || [];
-  if (role === 'user') list = list.filter(p => inStockSet.has(skuKey(p['貨品編號'])));
+  if (role === 'user') list = list.filter(p => inStockSet.has(p['貨品編號']));
   return list.slice(0, 10);
 }
 async function searchByBarcode(barcode, role, _branch, inStockSet) {
@@ -302,18 +293,18 @@ async function searchByBarcode(barcode, role, _branch, inStockSet) {
     .maybeSingle();
   if (error) throw error;
   if (!data) return [];
-  if (role === 'user' && !inStockSet.has(skuKey(data['貨品編號']))) return [];
+  if (role === 'user' && !inStockSet.has(data['貨品編號'])) return [];
   return [data];
 }
 async function searchBySku(sku, role, _branch, inStockSet) {
-  const s = String(sku || '').trim();
+  const s = String(sku || '').trim().toUpperCase();
   const { data: exact, error: e1 } = await supabase
     .from('products')
     .select('貨品名稱, 貨品編號, 箱入數, 單價')
     .eq('貨品編號', s)
     .maybeSingle();
   if (e1) throw e1;
-  if (exact && (role !== 'user' || inStockSet.has(skuKey(exact['貨品編號'])))) {
+  if (exact && (role !== 'user' || inStockSet.has(exact['貨品編號']))) {
     return [exact];
   }
   const { data: like, error: e2 } = await supabase
@@ -323,7 +314,7 @@ async function searchBySku(sku, role, _branch, inStockSet) {
     .limit(20);
   if (e2) throw e2;
   let list = like || [];
-  if (role === 'user') list = list.filter(p => inStockSet.has(skuKey(p['貨品編號'])));
+  if (role === 'user') list = list.filter(p => inStockSet.has(p['貨品編號']));
   return list.slice(0, 10);
 }
 
@@ -335,7 +326,7 @@ async function getWarehouseStockBySku(branch, sku) {
     .from('inventory_lots')
     .select('warehouse_name, uom, qty_left')
     .eq('branch_id', branchId)
-    .eq('product_sku', skuKey(sku));
+    .eq('product_sku', sku);
   if (error) throw error;
 
   const map = new Map();
@@ -387,7 +378,7 @@ async function getWarehouseStockForSku(branch, sku, warehouseDisplayName) {
     .from('inventory_lots')
     .select('warehouse_name, uom, qty_left')
     .eq('branch_id', branchId)
-    .eq('product_sku', skuKey(sku))
+    .eq('product_sku', sku)
     .in('warehouse_name', candidates);
   if (error) throw error;
 
@@ -411,7 +402,7 @@ async function getWarehouseSnapshotFromLots(branch, sku, warehouseDisplayName) {
   const { data: prod } = await supabase
     .from('products')
     .select('箱入數')
-    .eq('貨品編號', skuKey(sku))
+    .eq('貨品編號', sku)
     .maybeSingle();
   const unitsPerBox = Number(prod?.['箱入數'] || 1) || 1;
 
@@ -419,7 +410,7 @@ async function getWarehouseSnapshotFromLots(branch, sku, warehouseDisplayName) {
     .from('inventory_lots')
     .select('uom,qty_left,unit_cost,created_at,warehouse_name')
     .eq('branch_id', branchId)
-    .eq('product_sku', skuKey(sku))
+    .eq('product_sku', sku)
     .in('warehouse_name', candidates);
   if (error) throw error;
 
@@ -479,7 +470,7 @@ async function callFifoOutLots(branch, sku, uom, qty, warehouseDisplayName, line
 
   const { data, error } = await supabase.rpc('fifo_out_lots', {
     p_group: branch,
-    p_sku: skuKey(sku),
+    p_sku: sku,
     p_uom: uom,
     p_qty: qty,
     p_warehouse_name: whRaw || '',
@@ -501,7 +492,7 @@ async function changeInventoryByGroupSku(branch, sku, deltaBox, deltaPiece, line
   }
   const { data, error } = await supabase.rpc('exec_change_inventory_by_group_sku', {
     p_group: branch,
-    p_sku: skuKey(sku),
+    p_sku: sku,
     p_delta_box: deltaBox,
     p_delta_piece: deltaPiece,
     p_user_id: authUuid,
@@ -679,7 +670,7 @@ async function handleEvent(event) {
     const { data: prodRow } = await supabase
       .from('products')
       .select('貨品名稱, 箱入數')
-      .eq('貨品編號', skuKey(sku))
+      .eq('貨品編號', sku)
       .maybeSingle();
     const prodName = prodRow?.['貨品名稱'] || sku;
     const boxSize = prodRow?.['箱入數'] ?? '-';
@@ -688,7 +679,7 @@ async function handleEvent(event) {
 
     await replyText(
       `名稱：${prodName}\n` +
-      `編號：${skuDisplay(sku)}\n` +
+      `編號：${sku}\n` +
       `箱入數：${boxSize}\n` +
       `單價：${unitPrice}\n` +
       `倉庫類別：${wh}\n` +
@@ -888,7 +879,7 @@ async function handleEvent(event) {
         const { data: prodRow } = await supabase
           .from('products')
           .select('貨品名稱, 箱入數')
-          .eq('貨品編號', skuKey(skuLast))
+          .eq('貨品編號', skuLast)
           .maybeSingle();
         const prodName = prodRow?.['貨品名稱'] || skuLast;
 
