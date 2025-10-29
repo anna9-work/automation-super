@@ -255,7 +255,7 @@ async function getStockByGroupSku(branch, sku) {
   };
 }
 
-/** 取有庫存 SKU 集（一般使用者過濾）→ 查 inventory（與 1028 版一致） */
+/** 取有庫存 SKU 集（無論角色，一律用此過濾） */
 async function getInStockSkuSet(branch) {
   const { data, error } = await supabase
     .from('inventory')
@@ -271,8 +271,8 @@ async function getInStockSkuSet(branch) {
   return set;
 }
 
-/** 產品搜尋（名稱/條碼/編號）——使用者身分以 inventory 集合過濾 */
-async function searchByName(keyword, role, _branch, inStockSet) {
+/** 產品搜尋（名稱/條碼/編號）——不分角色，一律只回傳「有庫存」的品項 */
+async function searchByName(keyword, _role, _branch, inStockSet) {
   const k = String(keyword || '').trim();
   const { data, error } = await supabase
     .from('products')
@@ -281,10 +281,10 @@ async function searchByName(keyword, role, _branch, inStockSet) {
     .limit(20);
   if (error) throw error;
   let list = data || [];
-  if (role === 'user') list = list.filter(p => inStockSet.has(p['貨品編號']));
+  list = list.filter(p => inStockSet.has(p['貨品編號']));
   return list.slice(0, 10);
 }
-async function searchByBarcode(barcode, role, _branch, inStockSet) {
+async function searchByBarcode(barcode, _role, _branch, inStockSet) {
   const b = String(barcode || '').trim();
   const { data, error } = await supabase
     .from('products')
@@ -293,10 +293,10 @@ async function searchByBarcode(barcode, role, _branch, inStockSet) {
     .maybeSingle();
   if (error) throw error;
   if (!data) return [];
-  if (role === 'user' && !inStockSet.has(data['貨品編號'])) return [];
+  if (!inStockSet.has(data['貨品編號'])) return [];
   return [data];
 }
-async function searchBySku(sku, role, _branch, inStockSet) {
+async function searchBySku(sku, _role, _branch, inStockSet) {
   const s = String(sku || '').trim().toUpperCase();
   const { data: exact, error: e1 } = await supabase
     .from('products')
@@ -304,7 +304,7 @@ async function searchBySku(sku, role, _branch, inStockSet) {
     .eq('貨品編號', s)
     .maybeSingle();
   if (e1) throw e1;
-  if (exact && (role !== 'user' || inStockSet.has(exact['貨品編號']))) {
+  if (exact && inStockSet.has(exact['貨品編號'])) {
     return [exact];
   }
   const { data: like, error: e2 } = await supabase
@@ -314,7 +314,7 @@ async function searchBySku(sku, role, _branch, inStockSet) {
     .limit(20);
   if (e2) throw e2;
   let list = like || [];
-  if (role === 'user') list = list.filter(p => inStockSet.has(p['貨品編號']));
+  list = list.filter(p => inStockSet.has(p['貨品編號']));
   return list.slice(0, 10);
 }
 
@@ -657,12 +657,13 @@ async function handleEvent(event) {
   const reply = (messageObj) => client.replyMessage(event.replyToken, messageObj);
   const replyText = (textStr) => reply({ type: 'text', text: textStr });
 
-  const inStockSet = role === 'user' ? await getInStockSkuSet(branch) : new Set();
+  // ★ 一律只看有庫存品項（不分身分）
+  const inStockSet = await getInStockSkuSet(branch);
 
   // === 倉庫選擇（查詢後 step2；記憶最後選倉） ===
   if (parsed.type === 'wh_select') {
     const sku = await getLastSku(lineUserId, branch);
-    if (!sku) { await replyText('請先選擇商品（查 / 條碼 / 編號）後再選倉庫'); return; }
+    if (!sku || !inStockSet.has(sku)) { await replyText('請先選擇商品（查 / 條碼 / 編號）後再選倉庫'); return; }
 
     const wh = await resolveWarehouseLabel(parsed.warehouse);
     LAST_WAREHOUSE_BY_USER_BRANCH.set(`${lineUserId}::${branch}`, wh);
@@ -690,7 +691,7 @@ async function handleEvent(event) {
   // === 查詢（名稱）===
   if (parsed.type === 'query') {
     const list = await searchByName(parsed.keyword, role, branch, inStockSet);
-    if (!list.length) { await replyText(role === '主管' ? '查無此商品' : '無此商品庫存'); return; }
+    if (!list.length) { await replyText('無此商品庫存'); return; }
     if (list.length > 1) {
       await reply({ type: 'text', text: `找到以下與「${parsed.keyword}」相關的選項`, quickReply: buildQuickReplyForProducts(list) });
       return;
@@ -698,7 +699,7 @@ async function handleEvent(event) {
     const p = list[0];
     const sku = p['貨品編號'];
     const s = await getStockByGroupSku(branch, sku);
-    if (role === 'user' && s.box === 0 && s.piece === 0) { await replyText('無此商品庫存'); return; }
+    if (s.box === 0 && s.piece === 0) { await replyText('無此商品庫存'); return; }
     await upsertUserLastProduct(lineUserId, branch, sku);
 
     const whList = await getWarehouseStockBySku(branch, sku);
@@ -733,11 +734,11 @@ async function handleEvent(event) {
   // === 條碼 ===
   if (parsed.type === 'barcode') {
     const list = await searchByBarcode(parsed.barcode, role, branch, inStockSet);
-    if (!list.length) { await replyText(role === '主管' ? '查無此條碼商品' : '無此商品庫存'); return; }
+    if (!list.length) { await replyText('無此商品庫存'); return; }
     const p = list[0];
     const sku = p['貨品編號'];
     const s = await getStockByGroupSku(branch, sku);
-    if (role === 'user' && s.box === 0 && s.piece === 0) { await replyText('無此商品庫存'); return; }
+    if (s.box === 0 && s.piece === 0) { await replyText('無此商品庫存'); return; }
     await upsertUserLastProduct(lineUserId, branch, sku);
 
     const whList = await getWarehouseStockBySku(branch, sku);
@@ -772,7 +773,7 @@ async function handleEvent(event) {
   // === 指定貨號 ===
   if (parsed.type === 'sku') {
     const list = await searchBySku(parsed.sku, role, branch, inStockSet);
-    if (!list.length) { await replyText(role === '主管' ? '查無此貨品編號' : '無此商品庫存'); return; }
+    if (!list.length) { await replyText('無此商品庫存'); return; }
     if (list.length > 1) {
       await reply({ type: 'text', text: `找到以下與「${parsed.sku}」相關的選項`, quickReply: buildQuickReplyForProducts(list) });
       return;
@@ -780,7 +781,7 @@ async function handleEvent(event) {
     const p = list[0];
     const sku = p['貨品編號'];
     const s = await getStockByGroupSku(branch, sku);
-    if (role === 'user' && s.box === 0 && s.piece === 0) { await replyText('無此商品庫存'); return; }
+    if (s.box === 0 && s.piece === 0) { await replyText('無此商品庫存'); return; }
     await upsertUserLastProduct(lineUserId, branch, sku);
 
     const whList = await getWarehouseStockBySku(branch, sku);
@@ -818,7 +819,7 @@ async function handleEvent(event) {
     if (parsed.box === 0 && parsed.piece === 0) return;
 
     const skuLast = await getLastSku(lineUserId, branch);
-    if (!skuLast) { await replyText('請先用「查 商品」或「條碼123 / 編號ABC」選定商品後再入/出庫。'); return; }
+    if (!skuLast || !inStockSet.has(skuLast)) { await replyText('請先用「查 商品」或「條碼123 / 編號ABC」選定「有庫存」商品後再入/出庫。'); return; }
 
     if (parsed.action === 'out') {
       if (!parsed.warehouse) {
