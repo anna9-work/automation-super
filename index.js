@@ -87,14 +87,14 @@ async function resolveWarehouseLabel(codeOrName) {
   }
 }
 
-/** 把中文顯示名回推成 code（若找不到則 'unspecified'） */
-async function getWarehouseCodeForLabel(displayName) {
+/** 取得 FIFO / lots 用的「原始倉庫鍵」：優先 code/name 命中之一，取 candidates[0] */
+async function warehouseRawKeyFromDisplay(displayName) {
   const label = String(displayName || '').trim();
-  // 先從固定映射反查
+  // 固定映射的反查
   for (const [code, cn] of FIX_WH_LABEL.entries()) {
     if (cn === label) return code;
   }
-  // 再到 DB 查一次
+  // DB 查一把；有 code 優先回 code（與 lots 常用一致），否則回 name，再不行就原值或 'unspecified'
   const { data } = await supabase
     .from('inventory_warehouses')
     .select('code,name')
@@ -102,7 +102,8 @@ async function getWarehouseCodeForLabel(displayName) {
     .limit(1)
     .maybeSingle();
   if (data?.code) return data.code;
-  return 'unspecified';
+  if (data?.name) return data.name;
+  return label || 'unspecified';
 }
 
 /** 只查 line_user_map，把 LINE userId 轉成 auth.users.id (uuid) */
@@ -475,7 +476,7 @@ function buildQuickReplyForWarehouses(baseText, warehouseList, wantBox, wantPiec
 }
 
 /** FIFO 出庫（回 consumed 與 cost） */
-async function callFifoOutLots(branch, sku, uom, qty, warehouseDisplayName, lineUserId) {
+async function callFifoOutLots(branch, sku, uom, qty, warehouseRawKey, lineUserId) {
   const authUuid = await resolveAuthUuidFromLineUserId(lineUserId);
   if (!authUuid) {
     const hint = '此 LINE 使用者尚未對應到 auth.users。請先在 line_user_map 建立對應。';
@@ -483,15 +484,12 @@ async function callFifoOutLots(branch, sku, uom, qty, warehouseDisplayName, line
   }
   if (qty <= 0) return { consumed: 0, cost: 0 };
 
-  const candidates = await warehouseCandidates(warehouseDisplayName);
-  const whRaw = candidates[0] || warehouseDisplayName;
-
   const { data, error } = await supabase.rpc('fifo_out_lots', {
     p_group: branch,
     p_sku: sku,
     p_uom: uom,
     p_qty: qty,
-    p_warehouse_name: whRaw || '',
+    p_warehouse_name: warehouseRawKey || '',
     p_user_id: authUuid,
     p_source: 'LINE',
     p_now: new Date().toISOString()
@@ -652,24 +650,26 @@ app.use((err, req, res, next) => {
   return next(err);
 });
 
-/** ====== 出庫寫入 inventory_ledger ====== */
-async function recordLedgerOut({ branch, sku, warehouseLabel, qtyPiece, createdBy = 'linebot', refTable = 'linebot', refId = null }) {
+/** ====== 出庫寫入 inventory_ledger（箱/散分開；倉庫用 raw key） ====== */
+async function recordLedgerOut({ branch, sku, warehouseRawKey, qtyBox, qtyPiece, createdBy = 'linebot', refTable = 'linebot', refId = null, createdAtIso = null }) {
   const branchId = await getBranchIdByGroupCode(branch);
   if (!branchId) throw new Error('recordLedgerOut: 無法解析分店 ID');
-  const warehouseCode = await getWarehouseCodeForLabel(warehouseLabel);
+  const authUuid = await resolveAuthUuidFromLineUserId(createdBy === 'linebot' ? null : createdBy);
   const row = {
     branch_id: Number(branchId),
     product_sku: skuKey(sku),
-    warehouse_kind: warehouseCode,
+    warehouse_kind: String(warehouseRawKey || '未指定'),
     movement: 'OUT',
+    qty_box: Number(qtyBox || 0),
     qty_piece: Number(qtyPiece || 0),
     unit_cost: null,
     note: 'linebot out',
     ref_table: refTable,
     ref_id: refId,
-    created_by: createdBy,
+    created_by: authUuid || 'linebot',
+    created_at: createdAtIso || new Date().toISOString()
   };
-  if (!row.branch_id || !row.product_sku || row.qty_piece <= 0) throw new Error('recordLedgerOut: 參數不足或數量<=0');
+  if (!row.branch_id || !row.product_sku || (row.qty_box <= 0 && row.qty_piece <= 0)) throw new Error('recordLedgerOut: 參數不足或數量<=0');
   const { error } = await supabase.from('inventory_ledger').insert([row]);
   if (error) throw error;
 }
@@ -705,8 +705,8 @@ async function handleEvent(event) {
     const sku = await getLastSku(lineUserId, branch);
     if (!sku || !inStockSet.has(sku)) { await replyText('請先選擇商品（查 / 條碼 / 編號）後再選倉庫'); return; }
 
-    const wh = await resolveWarehouseLabel(parsed.warehouse);
-    LAST_WAREHOUSE_BY_USER_BRANCH.set(`${lineUserId}::${branch}`, wh);
+    const whLabel = await resolveWarehouseLabel(parsed.warehouse);
+    LAST_WAREHOUSE_BY_USER_BRANCH.set(`${lineUserId}::${branch}`, whLabel);
 
     const { data: prodRow } = await supabase
       .from('products')
@@ -715,8 +715,8 @@ async function handleEvent(event) {
       .maybeSingle();
     const prodName = prodRow?.['貨品名稱'] || sku;
     const boxSize = prodRow?.['箱入數'] ?? '-';
-    const unitPrice = await getWarehouseDisplayUnitCost(branch, sku, wh);
-    const { box, piece } = await getWarehouseStockForSku(branch, sku, wh);
+    const unitPrice = await getWarehouseDisplayUnitCost(branch, sku, whLabel);
+    const { box, piece } = await getWarehouseStockForSku(branch, sku, whLabel);
 
     await replyText(
       `品名：${prodName}\n` +
@@ -879,11 +879,12 @@ async function handleEvent(event) {
 
     try {
       if (parsed.action === 'out') {
-        const wh = await resolveWarehouseLabel(parsed.warehouse || '未指定');
-        LAST_WAREHOUSE_BY_USER_BRANCH.set(`${lineUserId}::${branch}`, wh);
+        const whLabel = await resolveWarehouseLabel(parsed.warehouse || '未指定'); // 顯示用
+        const whRaw = await warehouseRawKeyFromDisplay(whLabel);                 // FIFO/ledger join 用 raw key
+        LAST_WAREHOUSE_BY_USER_BRANCH.set(`${lineUserId}::${branch}`, whLabel);
 
         // 出庫前防呆：庫存不足（以 lots 快照檢查）
-        const beforeSnap = await getWarehouseSnapshotFromLots(branch, skuLast, wh);
+        const beforeSnap = await getWarehouseSnapshotFromLots(branch, skuLast, whLabel);
         const needPieces = (parsed.box > 0 ? parsed.box * (beforeSnap.unitsPerBox || 1) : 0) + (parsed.piece || 0);
         const hasPieces = beforeSnap.box * (beforeSnap.unitsPerBox || 1) + beforeSnap.piece;
         if (needPieces > hasPieces) {
@@ -891,14 +892,14 @@ async function handleEvent(event) {
           return;
         }
 
-        // FIFO 成本
+        // FIFO 成本（箱與散分開）
         let fifoCostTotal = 0;
         if (parsed.box > 0) {
-          const rBox = await callFifoOutLots(branch, skuLast, 'box', parsed.box, wh, lineUserId);
+          const rBox = await callFifoOutLots(branch, skuLast, 'box', parsed.box, whRaw, lineUserId);
           fifoCostTotal += Number(rBox.cost || 0);
         }
         if (parsed.piece > 0) {
-          const rPiece = await callFifoOutLots(branch, skuLast, 'piece', parsed.piece, wh, lineUserId);
+          const rPiece = await callFifoOutLots(branch, skuLast, 'piece', parsed.piece, whRaw, lineUserId);
           fifoCostTotal += Number(rPiece.cost || 0);
         }
 
@@ -912,20 +913,21 @@ async function handleEvent(event) {
           'LINE'
         );
 
-        // ===== 寫入 inventory_ledger: OUT =====
-        const totalPieces = needPieces; // 已是件數
+        // ===== 寫入 inventory_ledger: OUT（箱/散原樣）=====
         await recordLedgerOut({
           branch,
           sku: skuLast,
-          warehouseLabel: wh,
-          qtyPiece: totalPieces,
+          warehouseRawKey: whRaw,
+          qtyBox: parsed.box || 0,
+          qtyPiece: parsed.piece || 0,
           createdBy: 'linebot',
           refTable: 'linebot',
           refId: event.message?.id || null,
+          createdAtIso: formatTpeIso(new Date())
         });
 
         // 重新抓 lots 快照（庫存總額=lots 單價累加）
-        const afterSnap = await getWarehouseSnapshotFromLots(branch, skuLast, wh);
+        const afterSnap = await getWarehouseSnapshotFromLots(branch, skuLast, whLabel);
 
         // 商品名稱/箱入數
         const { data: prodRow } = await supabase
@@ -935,7 +937,7 @@ async function handleEvent(event) {
           .maybeSingle();
         const prodName = prodRow?.['貨品名稱'] || skuLast;
 
-        // 推 GAS（完全用 lots 計算）
+        // 推 GAS（用 lots 計算）
         const payload = {
           type: 'log',
           group: String(branch || '').trim().toLowerCase(),
@@ -951,7 +953,7 @@ async function handleEvent(event) {
           stock_piece: afterSnap.piece,
           out_amount: fifoCostTotal,
           stock_amount: afterSnap.stockAmount,
-          warehouse: wh,
+          warehouse: whLabel,
           created_at: formatTpeIso(new Date())
         };
         postInventoryToGAS(payload).catch(()=>{});
@@ -959,7 +961,7 @@ async function handleEvent(event) {
         await replyText(
           `✅ 出庫成功\n` +
           `品名：${prodName}\n` +
-          `倉別：${wh}\n` +
+          `倉別：${whLabel}\n` +
           `出庫：${parsed.box || 0}箱 ${parsed.piece || 0}件\n` +
           `👉目前庫存：${afterSnap.box}箱${afterSnap.piece}散`
         );
