@@ -911,11 +911,11 @@ async function handleEvent(event) {
         let fifoCostTotal = 0;
         if (parsed.box > 0) {
           const rBox = await callFifoOutLots(branch, skuLast, 'box', parsed.box, wh, lineUserId);
-          fifoCostTotal += Number(rBox.cost || 0);
+          fifoCostTotal += Number(rBox.cost || 0) * Number(rBox.consumed || 0);
         }
         if (parsed.piece > 0) {
           const rPiece = await callFifoOutLots(branch, skuLast, 'piece', parsed.piece, wh, lineUserId);
-          fifoCostTotal += Number(rPiece.cost || 0);
+          fifoCostTotal += Number(rPiece.cost || 0) * Number(rPiece.consumed || 0);
         }
 
         // 聚合（群組+SKU）——保留呼叫；實際查詢已不依賴 inventory
