@@ -5,9 +5,10 @@ import { createClient } from '@supabase/supabase-js';
 
 /**
  * =========================================================
- *  LINE Bot for Inventory (Single-TX Outbound)
- *  - 出庫：呼叫一個 RPC ⇒ 同一交易完成 FIFO 扣庫 + 寫流水
+ *  LINE Bot for Inventory (Single-TX Outbound + 統一業務日結存)
+ *  - 出庫：呼叫一個 RPC ⇒ 同一交易完成 FIFO 扣庫 + 寫流水（失敗整筆回滾）
  *  - 入庫：請用 App
+ *  - 查庫存/快照：走 RPC get_business_day_stock（與試算表一致，台北 05:00 分界）
  *  - GAS webhook：DB 成功才推（以 RPC 回傳值為準）
  * =========================================================
  */
@@ -52,6 +53,24 @@ const FIX_WH_LABEL = new Map([
 /* ======== Helpers ======== */
 const skuKey     = (s) => String(s||'').trim();
 const skuDisplay = (s) => { const t=String(s||'').trim(); return t? (t.slice(0,1).toUpperCase()+t.slice(1).toLowerCase()):''; };
+
+/* 業務日：台北 05:00 分界，回傳 'YYYY-MM-DD'（本地） */
+function getBizDateTodayTPE() {
+  const now = new Date();
+  const tpe = new Intl.DateTimeFormat('sv-SE', {
+    timeZone: 'Asia/Taipei', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+  }).format(now); // yyyy-mm-dd HH:mm:ss
+  const [d, hms] = tpe.split(' ');
+  const hh = parseInt(hms.split(':')[0], 10);
+  if (hh < 5) { // 05:00 前算前一天
+    const dt = new Date(d + 'T00:00:00+08:00');
+    dt.setDate(dt.getDate() - 1);
+    return dt.toISOString().slice(0,10);
+  }
+  return d;
+}
+
 function tpeNowISO() {
   const s=new Intl.DateTimeFormat('sv-SE',{ timeZone:'Asia/Taipei', year:'numeric',month:'2-digit',day:'2-digit', hour:'2-digit',minute:'2-digit', second:'2-digit', hour12:false }).format(new Date());
   return s.replace(' ','T') + '+08:00';
@@ -115,56 +134,51 @@ async function autoRegisterUser(lineUserId) {
   if (!data) await supabase.from('users').insert({ user_id: lineUserId, 群組: DEFAULT_GROUP, 角色:'user', 黑名單:false });
 }
 
-/* ======== Lots-based helpers (查詢顯示用) ======== */
+/* ======== 業務日結存：統一查詢 RPC（與試算表一致） ======== */
+/* 取「業務日結存」清單（替換原 lots 聚合） */
 async function getWarehouseStockBySku(branch, sku) {
-  const branchId = await getBranchIdByGroupCode(branch);
-  if (!branchId) return [];
-  const { data, error } = await supabase
-    .from('inventory_lots')
-    .select('warehouse_name, uom, qty_left')
-    .eq('branch_id', branchId)
-    .ilike('product_sku', sku);
-  if (error) throw error;
-  const map = new Map();
-  (data||[]).forEach(r => {
-    const name = String(r.warehouse_name||'未指定');
-    const u = String(r.uom||'').toLowerCase();
-    const q = Number(r.qty_left||0);
-    if (!map.has(name)) map.set(name, { warehouse: name, box:0, piece:0 });
-    const obj = map.get(name);
-    if (u==='box') obj.box += q;
-    else if (u==='piece') obj.piece += q;
+  const group = String(branch||'').trim().toLowerCase();
+  const s = String(sku||'').trim();
+  if (!group || !s) return [];
+  const bizDate = getBizDateTodayTPE();
+  const { data, error } = await supabase.rpc('get_business_day_stock', {
+    p_group: group, p_date: bizDate, p_sku: s, p_wh: null
   });
-  return Array.from(map.values()).filter(w => w.box>0 || w.piece>0);
+  if (error) throw error;
+  return (data||[]).map(r => ({
+    warehouse: String(r.warehouse_name||'未指定'),
+    box: Number(r.box||0),
+    piece: Number(r.piece||0),
+    unitsPerBox: Number(r.units_per_box||1),
+    unitPricePiece: Number(r.unit_price_piece||0),
+  })).filter(w => (w.box>0 || w.piece>0));
 }
+
+/* 取「業務日結存」單倉快照（替換原 lots 快照） */
 async function getWarehouseSnapshotFromLots(branch, sku, warehouseDisplayName) {
-  const branchId = await getBranchIdByGroupCode(branch);
-  if (!branchId) return { box:0, piece:0, stockAmount:0, displayUnitCost:0, unitsPerBox:1 };
-  const label = await resolveWarehouseLabel(warehouseDisplayName);
-  const { data:prod } = await supabase.from('products').select('箱入數').ilike('貨品編號', sku).maybeSingle();
-  const unitsPerBox = Number(prod?.['箱入數']||1) || 1;
+  const group = String(branch||'').trim().toLowerCase();
+  const s = String(sku||'').trim();
+  const wh = await resolveWarehouseLabel(warehouseDisplayName||'未指定');
+  const bizDate = getBizDateTodayTPE();
 
-  const { data, error } = await supabase
-    .from('inventory_lots')
-    .select('uom, qty_left, unit_cost, created_at, warehouse_name, product_sku')
-    .eq('branch_id', branchId)
-    .ilike('product_sku', sku)
-    .eq('warehouse_name', label);
+  const { data, error } = await supabase.rpc('get_business_day_stock', {
+    p_group: group, p_date: bizDate, p_sku: s, p_wh: wh
+  });
   if (error) throw error;
 
-  let box=0, piece=0, amount=0, displayUnitCost=0, latestTs=0;
-  (data||[]).forEach(r=>{
-    const u=String(r.uom||'').toLowerCase(); const q=Number(r.qty_left||0); const c=Number(r.unit_cost||0);
-    const ts=new Date(r.created_at||0).getTime();
-    if(u==='box') box+=q; else if(u==='piece') piece+=q;
-    const pieces=(u==='box') ? (q*unitsPerBox) : q;
-    amount += pieces * c;
-    if(q>0 && ts>=latestTs){ latestTs=ts; displayUnitCost=c; }
-  });
-  return { box, piece, stockAmount: amount, displayUnitCost, unitsPerBox };
+  const row = Array.isArray(data) ? data[0] : data;
+  if (!row) return { box:0, piece:0, stockAmount:0, displayUnitCost:0, unitsPerBox:1 };
+
+  const box = Number(row.box||0);
+  const piece = Number(row.piece||0);
+  const unitsPerBox = Number(row.units_per_box||1) || 1;
+  const unitPricePiece = Number(row.unit_price_piece||0);
+  const stockAmount = ((box*unitsPerBox) + piece) * unitPricePiece;
+
+  return { box, piece, stockAmount, displayUnitCost: unitPricePiece, unitsPerBox };
 }
 
-/* ======== Product search (products + lots) ======== */
+/* ======== Product search (products + 業務日結存) ======== */
 async function searchByName(keyword, _role, branch) {
   const k = String(keyword||'').trim();
   if (!k) return [];
@@ -266,7 +280,7 @@ function parseCommand(text) {
   return null;
 }
 
-/* ======== 單一交易出庫（RPC） ======== */
+/* ======== 單一交易出庫（RPC：fifo_out_and_log） ======== */
 async function callOutOnceTx({ branch, sku, outBox, outPiece, warehouseLabel, lineUserId }) {
   const authUuid = await resolveAuthUuidFromLineUserId(lineUserId);
   if (!authUuid) throw new Error(`找不到對應的使用者（${lineUserId}）。請先在 line_user_map 建立對應。`);
@@ -417,7 +431,7 @@ async function handleEvent(event){
     return;
   }
 
-  // 查詢（用 products + lots）
+  // 查詢（products + 業務日結存）
   const doQueryCommon = async (p) => {
     const sku = p['貨品編號'];
     const whList = await getWarehouseStockBySku(branch, sku);
