@@ -1,4 +1,4 @@
-// index.js — 僅修：inventory_logs 寫入「出庫金額」「庫存箱數/庫存散數」；其餘流程不變（散對散箱對箱、前快照-本次顯示）
+// index.js — 修正：#貨號查不到庫存 → 先走 daily_sheet_rows；出庫寫入 inventory_logs 的「出庫金額」「庫存箱/散」必填；維持散對散/箱對箱
 import 'dotenv/config';
 import express from 'express';
 import line from '@line/bot-sdk';
@@ -22,18 +22,18 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) console.error('缺少 Supabase 
 /* ======== App / Supabase ======== */
 const app = express(); // ⚠️ webhook 前不可掛 body parser
 const lineConfig = { channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN, channelSecret: LINE_CHANNEL_SECRET };
-app.use((req, _res, next) => {
-  console.log(`[請求] ${req.method} ${req.path} ua=${req.headers['user-agent']||''} x-line-signature=${req.headers['x-line-signature']?'yes':'no'}`);
-  next();
-});
 const client = new line.Client({ channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN });
 const supabase = createClient(SUPABASE_URL.replace(/\/+$/, ''), SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
 
-/* ======== 運行暫存 ======== */
+app.get('/health', (_req,res)=>res.status(200).send('OK'));
+app.get('/',       (_req,res)=>res.status(200).send('RUNNING'));
+app.post('/webhook',      line.middleware(lineConfig), lineHandler);
+app.post('/line/webhook', line.middleware(lineConfig), lineHandler);
+app.use((err, req, res, next) => { if (req.path==='/webhook' || req.path==='/line/webhook'){ console.error('[LINE MIDDLEWARE ERROR]', err?.message||err); return res.status(400).end(); } return next(err); });
+
+/* ======== 暫存 / 倉名對照 ======== */
 const LAST_WAREHOUSE_BY_USER_BRANCH = new Map(); // key=`${userId}::${branch}` -> 中文倉名
 const WAREHOUSE_NAME_CACHE = new Map();          // code/name -> 中文
-
-/* ======== 固定倉庫映射（code → 中文） ======== */
 const FIX_WH_LABEL = new Map([
   ['swap', '夾換品'],
   ['agency', '代夾物'],
@@ -47,9 +47,11 @@ const skuKey     = (s) => String(s||'').trim(); // 保留大小寫
 const skuUpper   = (s) => String(s||'').trim().toUpperCase();
 const skuDisplay = (s) => { const t=String(s||'').trim(); return t? (t.slice(0,1).toUpperCase()+t.slice(1).toLowerCase()):''; };
 const getBizDate = () => new Date(Date.now() - 5*60*60*1000).toISOString().slice(0,10); // 05:00 分界
+const norm       = (x) => String(x??'').trim();
 
+/* ======== 倉名解析 ======== */
 async function resolveWarehouseLabel(codeOrName) {
-  const key = String(codeOrName||'').trim();
+  const key = norm(codeOrName);
   if (!key) return '未指定';
   if (FIX_WH_LABEL.has(key)) return FIX_WH_LABEL.get(key);
   if (WAREHOUSE_NAME_CACHE.has(key)) return WAREHOUSE_NAME_CACHE.get(key);
@@ -68,46 +70,14 @@ async function resolveWarehouseLabel(codeOrName) {
   } catch { return key; }
 }
 async function getWarehouseCodeForLabel(displayName) {
-  const label = String(displayName||'').trim();
+  const label = norm(displayName);
   for (const [code, cn] of FIX_WH_LABEL.entries()) if (cn === label) return code;
   const { data } = await supabase.from('inventory_warehouses').select('code,name').or(`name.eq.${label},code.eq.${label}`).limit(1).maybeSingle();
   if (data?.code) return data.code;
   return 'unspecified';
 }
 
-async function resolveAuthUuidFromLineUserId(lineUserId) {
-  if (!lineUserId) return null;
-  const { data, error } = await supabase.from('line_user_map').select('auth_user_id').eq('line_user_id', lineUserId).maybeSingle();
-  if (error) { console.warn('[resolveAuthUuid] line_user_map error:', error); return null; }
-  return data?.auth_user_id || null;
-}
-
-/* ======== 指令解析 ======== */
-function parseCommand(text) {
-  const t = (text||'').trim();
-  if (!/^(查|查詢|條碼|編號|#|入庫|入|出庫|出|倉)/.test(t)) return null;
-  const mWhSel = t.match(/^倉(?:庫)?\s*(.+)$/);
-  if (mWhSel) return { type:'wh_select', warehouse: mWhSel[1].trim() };
-  const mBarcode = t.match(/^條碼[:：]?\s*(.+)$/);
-  if (mBarcode) return { type:'barcode', barcode: mBarcode[1].trim() };
-  const mSkuHash = t.match(/^#\s*(.+)$/);
-  if (mSkuHash) return { type:'sku', sku: mSkuHash[1].trim() };
-  const mSku = t.match(/^編號[:：]?\s*(.+)$/);
-  if (mSku) return { type:'sku', sku: mSku[1].trim() };
-  const mQuery = t.match(/^查(?:詢)?\s*(.+)$/);
-  if (mQuery) return { type:'query', keyword: mQuery[1].trim() };
-  const mChange = t.match(/^(入庫|入|出庫|出)\s*(?:(\d+)\s*箱)?\s*(?:(\d+)\s*(?:個|散|件))?(?:\s*(\d+))?(?:\s*(?:@|（?\(?倉庫[:：=]\s*)([^)）]+)\)?)?\s*$/);
-  if (mChange) {
-    const box = mChange[2] ? parseInt(mChange[2],10) : 0;
-    const pieceLabeled = mChange[3] ? parseInt(mChange[3],10) : 0;
-    const pieceTail = mChange[4] ? parseInt(mChange[4],10) : 0;
-    const warehouse = (mChange[5]||'').trim();
-    return { type:'change', action:/入/.test(mChange[1])?'in':'out', box, piece:pieceLabeled||pieceTail, warehouse: warehouse||null };
-  }
-  return null;
-}
-
-/* ======== 角色/分店/綁定 ======== */
+/* ======== 身分/分店 ======== */
 async function resolveBranchAndRole(event) {
   const src = event.source || {};
   const userId = src.userId || null;
@@ -148,14 +118,14 @@ async function getLastSku(lineUserId, branch) {
   return data?.['貨品編號'] || null;
 }
 
-/* ======== RPC（每日表） ======== */
+/* ======== RPC（日表） ======== */
 async function rpcDailyRows(branch, dateStr) {
   const { data, error } = await supabase.rpc('daily_sheet_rows', { p_group: branch, p_date: dateStr });
   if (error) throw error;
   return Array.isArray(data) ? data : (data ? [data] : []);
 }
 
-/* ======== lots / 庫存查詢（改用 RPC） ======== */
+/* ======== 查庫工具（RPC） ======== */
 async function getInStockSkuSet(branch, dateStr = getBizDate()) {
   const rows = await rpcDailyRows(branch, dateStr);
   const set = new Set();
@@ -175,7 +145,7 @@ async function getWarehouseStockBySku(branch, sku, dateStr = getBizDate()) {
     const piece = Number(r.stock_piece||0);
     if (box>0 || piece>0) list.push({ warehouse: r.warehouse_name || '未指定', box, piece, _code: r.warehouse_code || '' });
   }
-  // 合併同名倉（保險）
+  // 合併同名倉
   const map = new Map();
   for (const w of list) {
     const key = w.warehouse;
@@ -204,42 +174,85 @@ async function getWarehouseSnapshotFromRPC(branch, sku, warehouseDisplayName, da
   return { box:0, piece:0, stockAmount:0, displayUnitCost:0, unitsPerBox:1 };
 }
 
-/* ======== 產品查詢（僅回有庫存，透過 RPC 過濾） ======== */
+/* ======== A. 直接用 RPC 找 SKU（避免被 products 篩掉） ======== */
+async function rpcFindSku(branch, rawSku, dateStr = getBizDate()) {
+  const sUpper = skuUpper(rawSku);
+  const rows = await rpcDailyRows(branch, dateStr);
+  // 抓該 SKU 的「仍有庫存」的第一筆（任一倉即可）
+  const hit = rows.find(r => skuUpper(r.sku) === sUpper && (Number(r.stock_box||0)>0 || Number(r.stock_piece||0)>0));
+  if (!hit) return null;
+
+  // 儘量補齊名稱/箱入數/預設單價（若 products 找不到，用 RPC 值）
+  const { data: prod } = await supabase
+    .from('products')
+    .select('貨品名稱, 貨品編號, 箱入數, 單價')
+    .ilike('貨品編號', rawSku)
+    .maybeSingle();
+
+  return {
+    '貨品名稱': prod?.['貨品名稱'] || sUpper,
+    '貨品編號': sUpper,
+    '箱入數':   prod?.['箱入數'] ?? (Number(hit.units_per_box||1) || 1),
+    '單價':     prod?.['單價'] ?? Number(hit.unit_price_disp||0) || 0,
+    __rpc__: {
+      warehouse: hit.warehouse_name || '未指定',
+      stock_box: Number(hit.stock_box||0),
+      stock_piece: Number(hit.stock_piece||0),
+      unit_price_disp: Number(hit.unit_price_disp||0),
+    }
+  };
+}
+
+/* ======== 產品查詢 ======== */
 async function searchByName(keyword, _role, branch) {
   const k = String(keyword||'').trim();
+  const rows = await rpcDailyRows(branch, getBizDate());
+  const inStockUpper = new Set(rows.filter(r => (Number(r.stock_box||0)>0 || Number(r.stock_piece||0)>0)).map(r => skuUpper(r.sku)));
   const { data, error } = await supabase.from('products').select('貨品名稱, 貨品編號, 箱入數, 單價').ilike('貨品名稱', `%${k}%`).limit(20);
   if (error) throw error;
-  const set = await getInStockSkuSet(branch);
-  return (data||[]).filter(p=> set.has(skuUpper(p['貨品編號']))).slice(0,10);
+  return (data||[]).filter(p=> inStockUpper.has(skuUpper(p['貨品編號']))).slice(0,10);
 }
 async function searchByBarcode(barcode, _role, branch) {
   const b = String(barcode||'').trim();
+  const rows = await rpcDailyRows(branch, getBizDate());
+  const inStockUpper = new Set(rows.filter(r => (Number(r.stock_box||0)>0 || Number(r.stock_piece||0)>0)).map(r => skuUpper(r.sku)));
   const { data, error } = await supabase.from('products').select('貨品名稱, 貨品編號, 箱入數, 單價').eq('條碼', b).maybeSingle();
   if (error) throw error;
   if (!data) return [];
-  const set = await getInStockSkuSet(branch);
-  if (!set.has(skuUpper(data['貨品編號']))) return [];
+  if (!inStockUpper.has(skuUpper(data['貨品編號']))) return [];
   return [data];
 }
 async function searchBySku(sku, _role, branch) {
+  // A. 先用 RPC 找（最直接，不會被 products 過濾掉）
+  const fromRpc = await rpcFindSku(branch, sku, getBizDate());
+  if (fromRpc) return [fromRpc];
+
+  // B. 找不到才退回 products + 在庫集合過濾
   const s = String(sku||'').trim();
   const set = await getInStockSkuSet(branch);
-  const { data:exact, error:e1 } = await supabase.from('products').select('貨品名稱, 貨品編號, 箱入數, 單價').ilike('貨品編號', s).maybeSingle();
+  const { data:exact, error:e1 } = await supabase
+    .from('products')
+    .select('貨品名稱, 貨品編號, 箱入數, 單價')
+    .ilike('貨品編號', s)
+    .maybeSingle();
   if (e1) throw e1;
   if (exact && set.has(skuUpper(exact['貨品編號']))) return [exact];
-  const { data:like, error:e2 } = await supabase.from('products').select('貨品名稱, 貨品編號, 箱入數, 單價').ilike('貨品編號', `%${s}%`).limit(20);
+
+  const { data:like, error:e2 } = await supabase
+    .from('products')
+    .select('貨品名稱, 貨品編號, 箱入數, 單價')
+    .ilike('貨品編號', `%${s}%`)
+    .limit(20);
   if (e2) throw e2;
   return (like||[]).filter(p=> set.has(skuUpper(p['貨品編號']))).slice(0,10);
 }
 
-/* ======== FIFO 出庫（inventory_lots） ======== */
+/* ======== FIFO 出庫（lots） ======== */
 async function callFifoOutLots(branch, sku, uom, qty, warehouseDisplayName, lineUserId) {
   const authUuid = await resolveAuthUuidFromLineUserId(lineUserId);
   if (!authUuid) throw new Error(`找不到對應的使用者（${lineUserId}）。請先在 line_user_map 建立對應。`);
   if (qty <= 0) return { consumed: 0, cost: 0 };
-
   const whRaw = await resolveWarehouseLabel(warehouseDisplayName);
-
   const { data, error } = await supabase.rpc('fifo_out_lots', {
     p_group: branch,
     p_sku: skuKey(sku),
@@ -255,7 +268,7 @@ async function callFifoOutLots(branch, sku, uom, qty, warehouseDisplayName, line
   return { consumed: Number(row?.consumed||0), cost: Number(row?.cost||0) }; // cost = 單價(散)
 }
 
-/* ======== （可留可移除）舊存量彙總 RPC ======== */
+/* ======== 舊彙總 RPC（保留） ======== */
 async function changeInventoryByGroupSku(branch, sku, deltaBox, deltaPiece, lineUserId, source='LINE') {
   const authUuid = await resolveAuthUuidFromLineUserId(lineUserId);
   if (!authUuid) throw new Error(`找不到對應的使用者（${lineUserId}）。請先在 line_user_map 建立對應。`);
@@ -277,8 +290,8 @@ async function loadGasConfigFromDBIfNeeded() {
     if (error) throw error;
     if (Array.isArray(data)) {
       for (const row of data) {
-        const k = String(row.key||'').trim();
-        const v = String(row.value||'').trim();
+        const k = norm(row.key);
+        const v = norm(row.value);
         if (k==='gas_webhook_url' && v) GAS_URL_CACHE = v;
         if (k==='gas_webhook_secret' && v) GAS_SECRET_CACHE = v;
       }
@@ -324,7 +337,7 @@ function buildQuickReplyForWarehouses(baseText, warehouseList, wantBox, wantPiec
 }
 
 /* ======== 寫入 inventory_logs（出庫） ======== */
-// ★ 修正點：增加 stockAfterBox/stockAfterPiece，並確保出庫金額帶入
+/* ★ 重點修正：必寫出庫金額、庫存箱數/庫存散數（用「出庫前快照－本次」） */
 async function insertInventoryLogOut({ branch, sku, warehouseLabel, unitPricePiece, qtyBox, qtyPiece, stockAfterBox, stockAfterPiece, userId }) {
   const { data: prod } = await supabase.from('products').select('貨品名稱,"箱入數", 單價').ilike('貨品編號', sku).maybeSingle();
   const name = prod?.['貨品名稱'] || sku;
@@ -343,9 +356,9 @@ async function insertInventoryLogOut({ branch, sku, warehouseLabel, unitPricePie
     '入庫散數': 0,
     '出庫箱數': String(Number(qtyBox||0)),
     '出庫散數': String(Number(qtyPiece||0)),
-    '庫存箱數': String(Number(stockAfterBox||0)),   // ★ 新增
-    '庫存散數': String(Number(stockAfterPiece||0)), // ★ 新增
-    '出庫金額': String(outAmount),                  // ★ 必帶
+    '庫存箱數': String(Number(stockAfterBox||0)),   // ★
+    '庫存散數': String(Number(stockAfterPiece||0)), // ★
+    '出庫金額': String(outAmount),                  // ★
     '入庫金額': '0',
     '庫存金額': '0', // 由 GAS/報表端重算
     '建立時間': nowIso,
@@ -361,14 +374,6 @@ async function insertInventoryLogOut({ branch, sku, warehouseLabel, unitPricePie
 }
 
 /* ======== Webhook 主流程 ======== */
-app.get('/health', (_req,res)=>res.status(200).send('OK'));
-app.get('/',       (_req,res)=>res.status(200).send('RUNNING'));
-app.get('/webhook',      (_req,res)=>res.status(200).send('OK'));
-app.get('/line/webhook', (_req,res)=>res.status(200).send('OK'));
-app.post('/webhook',      line.middleware(lineConfig), lineHandler);
-app.post('/line/webhook', line.middleware(lineConfig), lineHandler);
-app.use((err, req, res, next) => { if (req.path==='/webhook' || req.path==='/line/webhook'){ console.error('[LINE MIDDLEWARE ERROR]', err?.message||err); return res.status(400).end(); } return next(err); });
-
 async function lineHandler(req, res) {
   try {
     const events = req.body?.events || [];
@@ -382,6 +387,32 @@ async function lineHandler(req, res) {
   }
 }
 
+/* ======== 指令解析 ======== */
+function parseCommand(text) {
+  const t = (text||'').trim();
+  if (!/^(查|查詢|條碼|編號|#|入庫|入|出庫|出|倉)/.test(t)) return null;
+  const mWhSel = t.match(/^倉(?:庫)?\s*(.+)$/);
+  if (mWhSel) return { type:'wh_select', warehouse: mWhSel[1].trim() };
+  const mBarcode = t.match(/^條碼[:：]?\s*(.+)$/);
+  if (mBarcode) return { type:'barcode', barcode: mBarcode[1].trim() };
+  const mSkuHash = t.match(/^#\s*(.+)$/);
+  if (mSkuHash) return { type:'sku', sku: mSkuHash[1].trim() };
+  const mSku = t.match(/^編號[:：]?\s*(.+)$/);
+  if (mSku) return { type:'sku', sku: mSku[1].trim() };
+  const mQuery = t.match(/^查(?:詢)?\s*(.+)$/);
+  if (mQuery) return { type:'query', keyword: mQuery[1].trim() };
+  const mChange = t.match(/^(入庫|入|出庫|出)\s*(?:(\d+)\s*箱)?\s*(?:(\d+)\s*(?:個|散|件))?(?:\s*(\d+))?(?:\s*(?:@|（?\(?倉庫[:：=]\s*)([^)）]+)\)?)?\s*$/);
+  if (mChange) {
+    const box = mChange[2] ? parseInt(mChange[2],10) : 0;
+    const pieceLabeled = mChange[3] ? parseInt(mChange[3],10) : 0;
+    const pieceTail = mChange[4] ? parseInt(mChange[4],10) : 0;
+    const warehouse = (mChange[5]||'').trim();
+    return { type:'change', action:/入/.test(mChange[1])?'in':'out', box, piece:pieceLabeled||pieceTail, warehouse: warehouse||null };
+  }
+  return null;
+}
+
+/* ======== 主流程 ======== */
 async function handleEvent(event){
   if (event.type!=='message' || event.message.type!=='text') return;
   const text = event.message.text || '';
@@ -422,12 +453,28 @@ async function handleEvent(event){
   const doQueryCommon = async (p) => {
     const sku = p['貨品編號'];
     const rows = await rpcDailyRows(branch, getBizDate());
+
+    // 來自 rpcFindSku 的即時快照（若有）→ 直接顯示（避免再度查不到）
+    if (p.__rpc__) {
+      await upsertUserLastProduct(lineUserId, branch, sku);
+      const unitPrice = Number(p.__rpc__.unit_price_disp || p['單價'] || 0);
+      await replyText(
+        `名稱：${p['貨品名稱']}\n` +
+        `編號：${sku}\n` +
+        `箱入數：${p['箱入數']??'-'}\n` +
+        `單價：${unitPrice}\n` +
+        `倉庫類別：${p.__rpc__.warehouse}\n` +
+        `庫存：${p.__rpc__.stock_box}箱${p.__rpc__.stock_piece}散`
+      );
+      return;
+    }
+
     const list = rows.filter(r => skuUpper(r.sku)===skuUpper(sku) && (Number(r.stock_box||0)>0 || Number(r.stock_piece||0)>0));
     if (!list.length) { await replyText('無此商品庫存'); return; }
 
     await upsertUserLastProduct(lineUserId, branch, sku);
 
-    // 多倉 → Quick Reply 選倉
+    // 多倉 → Quick Reply
     const whList = await getWarehouseStockBySku(branch, sku, getBizDate());
     if (whList.length >= 2) {
       await reply({ type:'text', text:`名稱：${p['貨品名稱']}\n編號：${sku}\n👉請選擇倉庫`, quickReply: buildQuickReplyForWarehousesForQuery(whList) });
@@ -436,7 +483,7 @@ async function handleEvent(event){
 
     // 單倉 → 直接顯示
     const chosen = whList[0] || { warehouse: (list[0]?.warehouse_name||'未指定'), box:Number(list[0]?.stock_box||0), piece:Number(list[0]?.stock_piece||0) };
-    const unitPrice = Number(list[0]?.unit_price_disp||0);
+    const unitPrice = Number(list[0]?.unit_price_disp||p['單價']||0);
     await replyText(`名稱：${p['貨品名稱']}\n編號：${sku}\n箱入數：${p['箱入數']??'-'}\n單價：${unitPrice}\n倉庫類別：${chosen.warehouse}\n庫存：${chosen.box}箱${chosen.piece}散`);
     return;
   };
@@ -453,6 +500,10 @@ async function handleEvent(event){
     await doQueryCommon(list[0]); return;
   }
   if (parsed.type==='sku') {
+    // ★ 先透過 RPC 直取（解決 #Nh028 查不到的問題）
+    const fromRpc = await rpcFindSku(branch, parsed.sku, getBizDate());
+    if (fromRpc) { await doQueryCommon(fromRpc); return; }
+
     const list = await searchBySku(parsed.sku, role, branch);
     if (!list.length) { await replyText('無此商品庫存'); return; }
     if (list.length>1) { await reply({ type:'text', text:`找到以下與「${parsed.sku}」相關的選項`, quickReply: buildQuickReplyForProducts(list) }); return; }
@@ -487,7 +538,7 @@ async function handleEvent(event){
         const productListPrice = Number(pInfo?.['單價'] || 0) || 0;
 
         // ✅ 散對散、箱對箱 檢查（不做跨單位換算）
-        if ((parsed.box||0) > beforeSnap.box) { await replyText(`庫存不足（箱）：該倉僅有 ${beforeSnap.box}箱` + (beforeSnap.piece>0?`${beforeSnap.piece}散`:'')); return; }
+        if ((parsed.box||0) > beforeSnap.box)  { await replyText(`庫存不足（箱）：該倉僅有 ${beforeSnap.box}箱` + (beforeSnap.piece>0?`${beforeSnap.piece}散`:'')); return; }
         if ((parsed.piece||0) > beforeSnap.piece) { await replyText(`庫存不足（散）：該倉僅有 ${beforeSnap.piece}散`); return; }
 
         // FIFO 扣庫（箱/散分別）
@@ -501,7 +552,7 @@ async function handleEvent(event){
           fifoUnitPieceCosts.push({ uom:'piece', consumed:rPiece.consumed, unitCost:rPiece.cost });
         }
 
-        // 出庫單價(散)：若同時有箱/散，以散的 FIFO 單價優先，否則用箱 FIFO，再用 RPC 單價，最後用 products.單價
+        // 出庫單價(散)備援：FIFO(散) > FIFO(箱) > RPC 單價 > products.單價
         const fifoPieceCost = Number(fifoUnitPieceCosts.find(x=>x.uom==='piece')?.unitCost || 0);
         const fifoBoxCost   = Number(fifoUnitPieceCosts.find(x=>x.uom==='box')?.unitCost   || 0);
         const rpcUnitDisp   = Number(beforeSnap.displayUnitCost || 0);
@@ -524,7 +575,7 @@ async function handleEvent(event){
         const afterBox   = beforeSnap.box   - (parsed.box   || 0);
         const afterPiece = beforeSnap.piece - (parsed.piece || 0);
 
-        // 寫 logs（★ 此處帶入 出庫金額 與 庫存箱/散）
+        // 寫 logs（★ 帶入出庫金額與庫存箱/散）
         const authUuid = await resolveAuthUuidFromLineUserId(lineUserId);
         await insertInventoryLogOut({
           branch,
@@ -538,14 +589,14 @@ async function handleEvent(event){
           userId: authUuid
         });
 
-        // 推 GAS（GAS 端重拉 RPC 覆蓋整頁）
+        // 推 GAS（GAS 端重拉）
         const payload = {
           type: 'log',
           group: String(branch||'').trim().toLowerCase(),
           sku: skuDisplay(skuLast),
           name: prodName,
           units_per_box: unitsPerBox,
-          unit_price: unitPricePiece, // 顯示單價（散）
+          unit_price: unitPricePiece,
           in_box: 0,
           in_piece: 0,
           out_box: parsed.box||0,
