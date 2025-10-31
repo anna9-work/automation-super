@@ -144,26 +144,71 @@ async function rpcDailyRows(branch, dateStr) {
   return Array.isArray(data) ? data : (data ? [data] : []);
 }
 
-/* ======== 查庫存（查詢時用 RPC；出庫顯示用 RPC 快照直接計算差額） ======== */
-async function getInStockSkuSet(branch, dateStr = getBizDate()) {
-  const rows = await rpcDailyRows(branch, dateStr);
+/* ======== lots 為準：判斷是否有庫存 / 取得倉庫分佈 / 快照 ======== */
+async function getInStockSkuSet(branch) {
+  const branchId = await getBranchIdByGroupCode(branch);
+  if (!branchId) return new Set();
+  const { data, error } = await supabase
+    .from('inventory_lots')
+    .select('product_sku, qty_left')
+    .eq('branch_id', branchId)
+    .gt('qty_left', 0);
+  if (error) throw error;
   const set = new Set();
-  for (const r of rows) {
-    const has = Number(r.stock_box||0) > 0 || Number(r.stock_piece||0) > 0;
-    if (has) set.add(skuUpper(r.sku));
-  }
+  (data||[]).forEach(r => { if (Number(r.qty_left||0)>0) set.add(skuUpper(r.product_sku)); });
   return set;
 }
-async function getWarehouseStockBySku(branch, sku, dateStr = getBizDate()) {
-  const rows = await rpcDailyRows(branch, dateStr);
-  const upper = skuUpper(sku);
-  const list = [];
-  for (const r of rows) {
-    if (skuUpper(r.sku) !== upper) continue;
-    const box = Number(r.stock_box||0);
-    const piece = Number(r.stock_piece||0);
-    if (box>0 || piece>0) list.push({ warehouse: r.warehouse_name || '未指定', box, piece, _code: r.warehouse_code || '' });
-  }
+async function getWarehouseStockBySku(branch, sku) {
+  const branchId = await getBranchIdByGroupCode(branch);
+  if (!branchId) return [];
+  const { data, error } = await supabase
+    .from('inventory_lots')
+    .select('warehouse_name, uom, qty_left')
+    .eq('branch_id', branchId)
+    .ilike('product_sku', sku);
+  if (error) throw error;
+  const map = new Map();
+  (data||[]).forEach(r => {
+    const name = String(r.warehouse_name||'未指定');
+    const u = String(r.uom||'').toLowerCase();
+    const q = Number(r.qty_left||0);
+    if (!map.has(name)) map.set(name, { warehouse: name, box:0, piece:0 });
+    const obj = map.get(name);
+    if (u==='box') obj.box += q;
+    else if (u==='piece') obj.piece += q;
+  });
+  return Array.from(map.values()).filter(w => w.box>0 || w.piece>0);
+}
+async function getWarehouseSnapshotFromLots(branch, sku, warehouseDisplayName) {
+  const branchId = await getBranchIdByGroupCode(branch);
+  if (!branchId) return { box:0, piece:0, stockAmount:0, displayUnitCost:0, unitsPerBox:1 };
+  const label = await resolveWarehouseLabel(warehouseDisplayName);
+  const { data:prod } = await supabase.from('products').select('箱入數').ilike('貨品編號', sku).maybeSingle();
+  const unitsPerBox = Number(prod?.['箱入數']||1) || 1;
+
+  const { data, error } = await supabase
+    .from('inventory_lots')
+    .select('uom, qty_left, unit_cost, created_at, warehouse_name, product_sku')
+    .eq('branch_id', branchId)
+    .ilike('product_sku', sku)
+    .eq('warehouse_name', label);
+  if (error) throw error;
+
+  let box=0, piece=0, amount=0, displayUnitCost=0, latestTs=0;
+  (data||[]).forEach(r=>{
+    const u=String(r.uom||'').toLowerCase(); const q=Number(r.qty_left||0); const c=Number(r.unit_cost||0);
+    const ts=new Date(r.created_at||0).getTime();
+    if(u==='box') box+=q; else if(u==='piece') piece+=q;
+    const pieces=(u==='box') ? (q*unitsPerBox) : q;
+    amount += pieces * c;
+    if(q>0 && ts>=latestTs){ latestTs=ts; displayUnitCost=c; }
+  });
+  return { box, piece, stockAmount: amount, displayUnitCost, unitsPerBox };
+}
+
+/* ======== 查庫存（查詢時用 RPC；出庫顯示用 RPC 快照直接計算差額） ======== */
+  return set;
+}
   // 合併同名倉（保險）
   const map = new Map();
   for (const w of list) {
@@ -174,20 +219,6 @@ async function getWarehouseStockBySku(branch, sku, dateStr = getBizDate()) {
   }
   return Array.from(map.values());
 }
-async function getWarehouseSnapshotFromRPC(branch, sku, warehouseDisplayName, dateStr = getBizDate()) {
-  const rows = await rpcDailyRows(branch, dateStr);
-  const upper = skuUpper(sku);
-  const label = await resolveWarehouseLabel(warehouseDisplayName);
-  for (const r of rows) {
-    if (skuUpper(r.sku) === upper && String(r.warehouse_name||'未指定') === label) {
-      return {
-        box: Number(r.stock_box||0),
-        piece: Number(r.stock_piece||0),
-        stockAmount: Number(r.stock_amount||0),
-        displayUnitCost: Number(r.unit_price_disp||0),
-        unitsPerBox: Number(r.units_per_box||1) || 1
-      };
-    }
   }
   // 沒找到 → 回 0
   return { box:0, piece:0, stockAmount:0, displayUnitCost:0, unitsPerBox:1 };
@@ -505,7 +536,7 @@ async function handleEvent(event){
         LAST_WAREHOUSE_BY_USER_BRANCH.set(`${lineUserId}::${branch}`, wh);
 
         // 出庫前快照（RPC，與試算表對齊）
-        const beforeSnap = await getWarehouseSnapshotFromRPC(branch, skuLast, wh, getBizDate());
+        const beforeSnap = await getWarehouseSnapshotFromLots(branch, skuLast, wh, getBizDate());
         const unitsPerBoxForCalc = beforeSnap.unitsPerBox || 1; // 僅用於金額與 GAS 組裝，不做箱↔散轉換扣量
 
         // 先做 FIFO 扣庫（箱/散分別）
