@@ -285,7 +285,7 @@ async function callFifoOutLots(branch, sku, uom, qty, warehouseDisplayName, line
   });
   if (error) throw error;
   const row = Array.isArray(data) ? data[0] : data;
-  return { consumed: Number(row?.consumed||0), cost: Number(row?.cost||0) }; // cost = 單價(散)
+  return { consumed: Number(row?.consumed||0), cost: Number(row?.cost||0) }; // cost: 對應 uom 的單位成本
 }
 
 /* ======== （可留）舊彙總 RPC ======== */
@@ -519,30 +519,27 @@ async function handleEvent(event){
       try {
         // FIFO 扣庫
         let fifoUnitPieceCosts = [];
+        let boxCostFromFifo = null;
+        let pieceCostFromFifo = null;
+
         if (parsed.box>0) {
           const rBox = await callFifoOutLots(branch, skuLast, 'box',   parsed.box,   wh, lineUserId);
           fifoUnitPieceCosts.push({ uom:'box',   consumed:rBox.consumed, unitCost:rBox.cost });
+          boxCostFromFifo = Number(rBox.cost||0); // 可能是「每箱成本」
         }
         if (parsed.piece>0) {
           const rPiece = await callFifoOutLots(branch, skuLast, 'piece', parsed.piece, wh, lineUserId);
           fifoUnitPieceCosts.push({ uom:'piece', consumed:rPiece.consumed, unitCost:rPiece.cost });
+          pieceCostFromFifo = Number(rPiece.cost||0); // 每件成本
         }
 
-        // 舊彙總（保留）
-        await changeInventoryByGroupSku(
-          branch,
-          skuLast,
-          parsed.box>0 ? -parsed.box : 0,
-          parsed.piece>0 ? -parsed.piece : 0,
-          lineUserId,
-          'LINE'
-        ).catch(()=>{});
+        // 取箱入數（決定是否需要把箱成本換算成件成本）
+        const { data: prodRowX } = await supabase.from('products').select('箱入數').ilike('貨品編號', skuLast).maybeSingle();
+        const unitsPerBoxX = Number(prodRowX?.['箱入數'] || 1) || 1;
 
-        // 出庫單價(散)：若有散，以散為準；否則用箱（每件成本）或快照顯示價
-        const unitPricePiece =
-          (fifoUnitPieceCosts.find(x=>x.uom==='piece')?.unitCost)
-          ?? (fifoUnitPieceCosts.find(x=>x.uom==='box')?.unitCost)
-          ?? Number(beforeSnap.displayUnitCost||0);
+        // 出庫單價(散)：若有散成本 → 用散；否則把箱成本 / 箱入數；最後退而求其次用快照顯示價
+        let unitPricePiece =
+          (pieceCostFromFifo ?? (boxCostFromFifo != null ? (boxCostFromFifo / unitsPerBoxX) : null) ?? Number(beforeSnap.displayUnitCost||0));
 
         // 不重查：用快照-本次出庫
         const afterBox   = Math.max(0, (beforeSnap.box||0)   - (parsed.box||0));
