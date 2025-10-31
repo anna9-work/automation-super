@@ -192,8 +192,9 @@ async function rpcFindSku(branch, rawSku, dateStr = getBizDate()) {
   return {
     '貨品名稱': prod?.['貨品名稱'] || sUpper,
     '貨品編號': sUpper,
-    '箱入數':   prod?.['箱入數'] ?? (Number(hit.units_per_box||1) || 1),
-    '單價':     prod?.['單價'] ?? Number(hit.unit_price_disp||0) || 0,
+    '箱入數':   (prod?.['箱入數'] ?? (Number(hit.units_per_box || 1) || 1)),
+    // ⚠️ 這裡加上括號避免「?? 與 || 混用」語法錯誤
+    '單價':     ((prod?.['單價'] ?? Number(hit.unit_price_disp || 0)) || 0),
     __rpc__: {
       warehouse: hit.warehouse_name || '未指定',
       stock_box: Number(hit.stock_box||0),
