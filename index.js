@@ -1,4 +1,4 @@
-// index.js — linebot 查庫存改為 daily_sheet_rows（05:00 業務日）；支援多倉 quick reply；其它流程不變
+// index.js — linebot 查庫存改為 daily_sheet_rows（05:00 業務日）；支援多倉 quick reply；出庫回覆改為「用前快照-本次數量」，且散對散、箱對箱
 import 'dotenv/config';
 import express from 'express';
 import line from '@line/bot-sdk';
@@ -338,16 +338,6 @@ function logEventSummary(event){
   }catch(e){ console.error('[LINE EVENT LOG ERROR]', e); }
 }
 
-/* ======== Webhook 路由 ======== */
-const lineConfig = { channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN, channelSecret: LINE_CHANNEL_SECRET };
-app.get('/health', (_req,res)=>res.status(200).send('OK'));
-app.get('/',       (_req,res)=>res.status(200).send('RUNNING'));
-app.get('/webhook',      (_req,res)=>res.status(200).send('OK'));
-app.get('/line/webhook', (_req,res)=>res.status(200).send('OK'));
-app.post('/webhook',      line.middleware(lineConfig), lineHandler);
-app.post('/line/webhook', line.middleware(lineConfig), lineHandler);
-app.use((err, req, res, next) => { if (req.path==='/webhook' || req.path==='/line/webhook'){ console.error('[LINE MIDDLEWARE ERROR]', err?.message||err); return res.status(400).end(); } return next(err); });
-
 /* ======== 寫入 inventory_logs（出庫） ======== */
 async function insertInventoryLogOut({ branch, sku, warehouseLabel, unitPricePiece, qtyBox, qtyPiece, userId, refTable, refId }) {
   // 產品資訊（箱入數）
@@ -359,11 +349,8 @@ async function insertInventoryLogOut({ branch, sku, warehouseLabel, unitPricePie
   const totalPiecesOut = (Number(qtyBox||0)*unitsPerBox) + Number(qtyPiece||0);
   const outAmount = totalPiecesOut * Number(unitPricePiece||0);
 
-  // 出庫後快照（從 RPC）
-  const snap = await getWarehouseSnapshotFromRPC(branch, sku, warehouseLabel, getBizDate());
+  // 出庫後快照（此函式只寫 logs，不再查最新 RPC）
   const warehouseCode = await getWarehouseCodeForLabel(warehouseLabel);
-  const stockAmount = ((snap.box * unitsPerBox) + snap.piece) * Number(snap.displayUnitCost || unitPricePiece || 0);
-
   const nowIso = new Date().toISOString();
 
   // 確保 inventory_logs 已有「倉庫別」「倉庫代碼」欄位
@@ -376,7 +363,7 @@ async function insertInventoryLogOut({ branch, sku, warehouseLabel, unitPricePie
     '出庫散數': String(Number(qtyPiece||0)),
     '出庫金額': String(outAmount),         // text 欄位
     '入庫金額': '0',
-    '庫存金額': String(stockAmount),       // text 欄位
+    '庫存金額': '0',                       // 留 0；由 GAS/報表端整頁重拉計算
     '建立時間': nowIso,
     '群組': String(branch||'').trim().toLowerCase(),
     '操作來源': 'LINE',
@@ -390,6 +377,15 @@ async function insertInventoryLogOut({ branch, sku, warehouseLabel, unitPricePie
 }
 
 /* ======== Webhook 主流程 ======== */
+const lineConfig = { channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN, channelSecret: LINE_CHANNEL_SECRET };
+app.get('/health', (_req,res)=>res.status(200).send('OK'));
+app.get('/',       (_req,res)=>res.status(200).send('RUNNING'));
+app.get('/webhook',      (_req,res)=>res.status(200).send('OK'));
+app.get('/line/webhook', (_req,res)=>res.status(200).send('OK'));
+app.post('/webhook',      line.middleware(lineConfig), lineHandler);
+app.post('/line/webhook', line.middleware(lineConfig), lineHandler);
+app.use((err, req, res, next) => { if (req.path==='/webhook' || req.path==='/line/webhook'){ console.error('[LINE MIDDLEWARE ERROR]', err?.message||err); return res.status(400).end(); } return next(err); });
+
 async function lineHandler(req, res) {
   try {
     const events = req.body?.events || [];
@@ -501,11 +497,21 @@ async function handleEvent(event){
         const wh = await resolveWarehouseLabel(parsed.warehouse || '未指定');
         LAST_WAREHOUSE_BY_USER_BRANCH.set(`${lineUserId}::${branch}`, wh);
 
-        // 出庫前防呆（用 RPC 快照）
+        // 出庫前快照（用 RPC 快照）
         const beforeSnap = await getWarehouseSnapshotFromRPC(branch, skuLast, wh, getBizDate());
-        const needPieces = (parsed.box>0 ? parsed.box*(beforeSnap.unitsPerBox||1) : 0) + (parsed.piece||0);
-        const hasPieces  = beforeSnap.box*(beforeSnap.unitsPerBox||1) + beforeSnap.piece;
-        if (needPieces > hasPieces) { await replyText(`庫存不足：該倉僅有 ${beforeSnap.box}箱${beforeSnap.piece}件`); return; }
+        const { data: prodRow } = await supabase.from('products').select('貨品名稱, 箱入數').ilike('貨品編號', skuLast).maybeSingle();
+        const prodName = prodRow?.['貨品名稱'] || skuLast;
+        const unitsPerBox = Number(prodRow?.['箱入數'] || 1) || 1;
+
+        // ✅ 散對散、箱對箱 檢查（不做跨單位換算）
+        if ((parsed.box||0) > beforeSnap.box) {
+          await replyText(`庫存不足（箱）：該倉僅有 ${beforeSnap.box}箱` + (beforeSnap.piece>0?`${beforeSnap.piece}散`:''));
+          return;
+        }
+        if ((parsed.piece||0) > beforeSnap.piece) {
+          await replyText(`庫存不足（散）：該倉僅有 ${beforeSnap.piece}散`);
+          return;
+        }
 
         // FIFO 扣庫（箱/散分別）
         let fifoUnitPieceCosts = [];
@@ -534,6 +540,10 @@ async function handleEvent(event){
           ?? (fifoUnitPieceCosts.find(x=>x.uom==='box')?.unitCost)
           ?? 0;
 
+        // ✅ 不再查「出庫後」RPC；直接用「前快照－本次出庫」計算顯示
+        const afterBox   = beforeSnap.box   - (parsed.box   || 0);
+        const afterPiece = beforeSnap.piece - (parsed.piece || 0);
+
         // 寫 logs
         const authUuid = await resolveAuthUuidFromLineUserId(lineUserId);
         await insertInventoryLogOut({
@@ -548,13 +558,7 @@ async function handleEvent(event){
           refId: event.message?.id || null
         });
 
-        // 出庫後回報（用 RPC 快照）
-        const afterSnap = await getWarehouseSnapshotFromRPC(branch, skuLast, wh, getBizDate());
-        const { data: prodRow } = await supabase.from('products').select('貨品名稱, 箱入數').ilike('貨品編號', skuLast).maybeSingle();
-        const prodName = prodRow?.['貨品名稱'] || skuLast;
-        const unitsPerBox = Number(prodRow?.['箱入數'] || 1) || 1;
-
-        // 推 GAS（GAS 端重拉 RPC 覆蓋整頁）
+        // 推 GAS（GAS 端重拉 RPC 覆蓋整頁；此處帶上我們計算的 after 值僅供參考）
         const payload = {
           type: 'log',
           group: String(branch||'').trim().toLowerCase(),
@@ -564,12 +568,12 @@ async function handleEvent(event){
           unit_price: unitPricePiece, // 顯示單價（散）
           in_box: 0,
           in_piece: 0,
-          out_box: parsed.box,
-          out_piece: parsed.piece,
-          stock_box: afterSnap.box,
-          stock_piece: afterSnap.piece,
-          out_amount: (parsed.box*unitsPerBox + parsed.piece) * unitPricePiece,
-          stock_amount: ((afterSnap.box*unitsPerBox)+afterSnap.piece) * (afterSnap.displayUnitCost || unitPricePiece || 0),
+          out_box: parsed.box||0,
+          out_piece: parsed.piece||0,
+          stock_box: afterBox,
+          stock_piece: afterPiece,
+          out_amount: ((parsed.box||0)*unitsPerBox + (parsed.piece||0)) * unitPricePiece,
+          stock_amount: ((afterBox*unitsPerBox)+afterPiece) * (beforeSnap.displayUnitCost || unitPricePiece || 0),
           warehouse: wh,
           created_at: formatTpeIso(new Date())
         };
@@ -580,7 +584,7 @@ async function handleEvent(event){
           `品名：${prodName}\n` +
           `倉別：${wh}\n` +
           `出庫：${parsed.box||0}箱 ${parsed.piece||0}件\n` +
-          `👉目前庫存：${afterSnap.box}箱${afterSnap.piece}散`
+          `👉目前庫存：${afterBox}箱${afterPiece}散`
         );
         return;
       } catch (err) {
