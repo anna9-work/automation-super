@@ -1,4 +1,4 @@
-// index.js — 查詢改 daily_sheet_rows（05:00 業務日）；出庫後回覆用「當前快照 - 本次出庫」，不重新查；其它流程不變
+// index.js — 查詢改 daily_sheet_rows（05:00 業務日）；出庫後回覆用「當前快照 - 本次出庫」，不重新查；箱對箱、散對散；FIFO；多倉 Quick Reply；GAS 推送
 import 'dotenv/config';
 import express from 'express';
 import line from '@line/bot-sdk';
@@ -137,23 +137,6 @@ async function autoRegisterUser(lineUserId) {
   if (!data) await supabase.from('users').insert({ user_id: lineUserId, 群組: DEFAULT_GROUP, 角色:'user', 黑名單:false });
 }
 
-/* ======== 使用者最後商品 ======== */
-async function upsertUserLastProduct(lineUserId, branch, sku) {
-  if (!lineUserId) return;
-  const now = new Date().toISOString();
-  const { data } = await supabase.from('user_last_product').select('id').eq('user_id', lineUserId).eq('群組', branch).maybeSingle();
-  if (data) {
-    await supabase.from('user_last_product').update({ '貨品編號': sku, '建立時間': now }).eq('user_id', lineUserId).eq('群組', branch);
-  } else {
-    await supabase.from('user_last_product').insert({ user_id: lineUserId, 群組: branch, '貨品編號': sku, '建立時間': now });
-  }
-}
-async function getLastSku(lineUserId, branch) {
-  const { data, error } = await supabase.from('user_last_product').select('貨品編號').eq('user_id', lineUserId).eq('群組', branch).order('建立時間',{ascending:false}).limit(1).maybeSingle();
-  if (error) throw error;
-  return data?.['貨品編號'] || null;
-}
-
 /* ======== RPC（每日表） ======== */
 async function rpcDailyRows(branch, dateStr) {
   const { data, error } = await supabase.rpc('daily_sheet_rows', { p_group: branch, p_date: dateStr });
@@ -208,6 +191,56 @@ async function getWarehouseSnapshotFromRPC(branch, sku, warehouseDisplayName, da
   }
   // 沒找到 → 回 0
   return { box:0, piece:0, stockAmount:0, displayUnitCost:0, unitsPerBox:1 };
+}
+
+/* ======== 產品搜尋（用 products；再用 daily_sheet_rows 過濾僅顯示有庫存的） ======== */
+async function searchByName(keyword, _role, branch) {
+  const k = String(keyword||'').trim();
+  if (!k) return [];
+  const { data, error } = await supabase
+    .from('products')
+    .select('貨品名稱, 貨品編號, 箱入數, 單價')
+    .ilike('貨品名稱', `%${k}%`)
+    .limit(30);
+  if (error) throw error;
+  const set = await getInStockSkuSet(branch, getBizDate());
+  return (data||[]).filter(p => set.has(String(p['貨品編號']).toUpperCase())).slice(0, 10);
+}
+
+async function searchByBarcode(barcode, _role, branch) {
+  const b = String(barcode||'').trim();
+  if (!b) return [];
+  const { data, error } = await supabase
+    .from('products')
+    .select('貨品名稱, 貨品編號, 箱入數, 單價')
+    .eq('條碼', b)
+    .maybeSingle();
+  if (error) throw error;
+  if (!data) return [];
+  const set = await getInStockSkuSet(branch, getBizDate());
+  return set.has(String(data['貨品編號']).toUpperCase()) ? [data] : [];
+}
+
+async function searchBySku(sku, _role, branch) {
+  const s = String(sku||'').trim();
+  if (!s) return [];
+  // 先精準，再模糊；都只回「有庫存」的
+  const { data: exact, error: e1 } = await supabase
+    .from('products')
+    .select('貨品名稱, 貨品編號, 箱入數, 單價')
+    .ilike('貨品編號', s)
+    .maybeSingle();
+  if (e1) throw e1;
+  const set = await getInStockSkuSet(branch, getBizDate());
+  if (exact && set.has(String(exact['貨品編號']).toUpperCase())) return [exact];
+
+  const { data: like, error: e2 } = await supabase
+    .from('products')
+    .select('貨品名稱, 貨品編號, 箱入數, 單價')
+    .ilike('貨品編號', `%${s}%`)
+    .limit(30);
+  if (e2) throw e2;
+  return (like||[]).filter(p => set.has(String(p['貨品編號']).toUpperCase())).slice(0, 10);
 }
 
 /* ======== FIFO 出庫（inventory_lots） ======== */
@@ -528,7 +561,7 @@ async function handleEvent(event){
           type: 'log',
           group: String(branch||'').trim().toLowerCase(),
           sku: skuDisplay(skuLast),
-          name: '',                 // GAS 會在 daily_sheet_rows 重抓
+          name: '',
           units_per_box: unitsPerBoxForCalc,
           unit_price: unitPricePiece,
           in_box: 0,
