@@ -42,7 +42,6 @@ const FIX_WH_LABEL = new Map([
 
 /* ======== 小工具 ======== */
 const skuKey     = (s) => String(s||'').trim(); // 保留大小寫（不自動改）
-const skuUpper   = (s) => String(s||'').trim().toUpperCase();
 const skuDisplay = (s) => { const t=String(s||'').trim(); return t? (t.slice(0,1).toUpperCase()+t.slice(1).toLowerCase()):''; };
 function tpeNowISO() {
   const s=new Intl.DateTimeFormat('sv-SE',{ timeZone:'Asia/Taipei', year:'numeric',month:'2-digit',day:'2-digit', hour:'2-digit',minute:'2-digit', second:'2-digit', hour12:false }).format(new Date());
@@ -89,7 +88,6 @@ async function getBranchIdByGroupCode(groupCode) {
   if (!key) return null;
   const { data, error } = await supabase.from('branches').select('id, "分店代號"').ilike('分店代號', key).maybeSingle();
   if (error) throw error;
-  if (!data?.id) console.warn('[WARN] branch not found for group=', key);
   return data?.id ?? null;
 }
 async function resolveBranchAndRole(event) {
@@ -223,7 +221,7 @@ async function searchBySku(sku, _role, branch) {
   return filtered;
 }
 
-/* ======== Quick Reply（唯一版本；避免重複宣告） ======== */
+/* ======== Quick Reply ======== */
 function buildQuickReplyForProducts(products){
   const items = products.slice(0,12).map(p=>({ type:'action', action:{ type:'message', label:`${p['貨品名稱']}`.slice(0,20), text:`編號 ${p['貨品編號']}` }}));
   return { items };
@@ -319,6 +317,8 @@ async function insertInventoryLogOut({ branch, sku, warehouseLabel, unitPricePie
     '入庫散數': 0,
     '出庫箱數': String(Number(qtyBox||0)),
     '出庫散數': String(Number(qtyPiece||0)),
+    '庫存箱數': String(Number(afterBox||0)),   // ★ 補上期末箱數
+    '庫存散數': String(Number(afterPiece||0)), // ★ 補上期末散數
     '出庫金額': String(outAmount),
     '入庫金額': '0',
     '庫存金額': String(stockAmount),
@@ -518,18 +518,15 @@ async function handleEvent(event){
 
       try {
         // FIFO 扣庫
-        let fifoUnitPieceCosts = [];
         let boxCostFromFifo = null;
         let pieceCostFromFifo = null;
 
         if (parsed.box>0) {
           const rBox = await callFifoOutLots(branch, skuLast, 'box',   parsed.box,   wh, lineUserId);
-          fifoUnitPieceCosts.push({ uom:'box',   consumed:rBox.consumed, unitCost:rBox.cost });
-          boxCostFromFifo = Number(rBox.cost||0); // 可能是「每箱成本」
+          boxCostFromFifo = Number(rBox.cost||0); // 可能是每箱成本
         }
         if (parsed.piece>0) {
           const rPiece = await callFifoOutLots(branch, skuLast, 'piece', parsed.piece, wh, lineUserId);
-          fifoUnitPieceCosts.push({ uom:'piece', consumed:rPiece.consumed, unitCost:rPiece.cost });
           pieceCostFromFifo = Number(rPiece.cost||0); // 每件成本
         }
 
@@ -538,14 +535,15 @@ async function handleEvent(event){
         const unitsPerBoxX = Number(prodRowX?.['箱入數'] || 1) || 1;
 
         // 出庫單價(散)：若有散成本 → 用散；否則把箱成本 / 箱入數；最後退而求其次用快照顯示價
+        const snapBefore = await getWarehouseSnapshotFromLots(branch, skuLast, wh);
         let unitPricePiece =
-          (pieceCostFromFifo ?? (boxCostFromFifo != null ? (boxCostFromFifo / unitsPerBoxX) : null) ?? Number(beforeSnap.displayUnitCost||0));
+          (pieceCostFromFifo ?? (boxCostFromFifo != null ? (boxCostFromFifo / unitsPerBoxX) : null) ?? Number(snapBefore.displayUnitCost||0));
 
         // 不重查：用快照-本次出庫
-        const afterBox   = Math.max(0, (beforeSnap.box||0)   - (parsed.box||0));
-        const afterPiece = Math.max(0, (beforeSnap.piece||0) - (parsed.piece||0));
+        const afterBox   = Math.max(0, (snapBefore.box||0)   - (parsed.box||0));
+        const afterPiece = Math.max(0, (snapBefore.piece||0) - (parsed.piece||0));
 
-        // 寫 logs
+        // 寫 logs（★ 補上 庫存箱數/庫存散數）
         const authUuid = await resolveAuthUuidFromLineUserId(lineUserId);
         await insertInventoryLogOut({
           branch,
@@ -570,7 +568,7 @@ async function handleEvent(event){
           `👉目前庫存：${afterBox}箱${afterPiece}散`
         );
 
-        // 推 GAS：以 daily_sheet_rows 重繪當日分頁
+        // 推 GAS（以 RPC 重繪當日分頁）
         try {
           const { data: prodRow2 } = await supabase.from('products').select('貨品名稱, 箱入數').ilike('貨品編號', skuLast).maybeSingle();
           const prodName = prodRow2?.['貨品名稱'] || skuLast;
@@ -595,7 +593,12 @@ async function handleEvent(event){
             warehouse: wh,
             created_at: tpeNowISO()
           };
-          postInventoryToGAS(payload).catch(()=>{});
+          // 發送；GAS 端用 daily_sheet_rows 覆蓋
+          const { url, secret } = await getGasConfig();
+          if (url && secret) {
+            const callUrl = `${url.replace(/\?+.*/,'')}?secret=${encodeURIComponent(secret)}`;
+            await fetch(callUrl,{ method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+          }
         } catch(_) {}
 
         return;
