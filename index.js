@@ -5,11 +5,10 @@ import { createClient } from '@supabase/supabase-js';
 
 /**
  * =========================================================
- *  LINE Bot for Inventory (FIFO lots + running ledger)
- *  - Outbound via LINE only (入庫請用 App)
- *  - Writes to: inventory_running (NOT inventory_logs)
- *  - GAS webhook: unchanged; payload.type = 'log'
- *  - Business date boundary handled in DB/RPC
+ *  LINE Bot for Inventory (Single-TX Outbound)
+ *  - 出庫：呼叫一個 RPC ⇒ 同一交易完成 FIFO 扣庫 + 寫流水
+ *  - 入庫：請用 App
+ *  - GAS webhook：維持由 Node 成功後再推（DB 成功才推）
  * =========================================================
  */
 
@@ -78,13 +77,6 @@ async function resolveWarehouseLabel(codeOrName) {
     return label;
   } catch { return key; }
 }
-async function getWarehouseCodeForLabel(displayName) {
-  const label = String(displayName||'').trim();
-  for (const [code, cn] of FIX_WH_LABEL.entries()) if (cn === label) return code;
-  const { data } = await supabase.from('inventory_warehouses').select('code,name').or(`name.eq.${label},code.eq.${label}`).limit(1).maybeSingle();
-  if (data?.code) return data.code;
-  return 'unspecified';
-}
 
 /* ======== Branch & User ======== */
 async function resolveAuthUuidFromLineUserId(lineUserId) {
@@ -123,7 +115,7 @@ async function autoRegisterUser(lineUserId) {
   if (!data) await supabase.from('users').insert({ user_id: lineUserId, 群組: DEFAULT_GROUP, 角色:'user', 黑名單:false });
 }
 
-/* ======== Lots-based helpers ======== */
+/* ======== Lots-based helpers (查詢顯示用) ======== */
 async function getWarehouseStockBySku(branch, sku) {
   const branchId = await getBranchIdByGroupCode(branch);
   if (!branchId) return [];
@@ -274,62 +266,36 @@ function parseCommand(text) {
   return null;
 }
 
-/* ======== FIFO 出庫（inventory_lots） ======== */
-async function callFifoOutLots(branch, sku, uom, qty, warehouseDisplayName, lineUserId) {
+/* ======== 單一交易出庫（RPC） ======== */
+async function callOutOnceTx({ branch, sku, outBox, outPiece, warehouseLabel, lineUserId }) {
   const authUuid = await resolveAuthUuidFromLineUserId(lineUserId);
   if (!authUuid) throw new Error(`找不到對應的使用者（${lineUserId}）。請先在 line_user_map 建立對應。`);
-  if (qty <= 0) return { consumed: 0, cost: 0 };
 
-  const whRaw = await resolveWarehouseLabel(warehouseDisplayName);
-  const { data, error } = await supabase.rpc('fifo_out_lots', {
-    p_group: String(branch||'').trim().toLowerCase(),
-    p_sku: skuKey(sku),
-    p_uom: uom,
-    p_qty: qty,
-    p_warehouse_name: whRaw || '',
-    p_user_id: authUuid,
-    p_source: 'LINE',
-    p_now: new Date().toISOString()
-  });
-  if (error) throw error;
-  const row = Array.isArray(data) ? data[0] : data;
-  return { consumed: Number(row?.consumed||0), cost: Number(row?.cost||0) }; // cost: 對應 uom 的單位成本
-}
-
-/* ======== Running Inserts ======== */
-async function insertInventoryRunningOut({ branch, sku, warehouseLabel, unitPricePiece, qtyBox, qtyPiece, userId, afterBox, afterPiece }) {
-  const { data: prod } = await supabase.from('products').select('貨品名稱,"箱入數"').ilike('貨品編號', sku).maybeSingle();
-  const name = prod?.['貨品名稱'] || sku;
-  const unitsPerBox = Number(prod?.['箱入數'] || 1) || 1;
-
-  const totalPiecesOut = (Number(qtyBox||0)*unitsPerBox) + Number(qtyPiece||0);
-  const outAmount = totalPiecesOut * Number(unitPricePiece||0);
-  const stockAmount = ((Number(afterBox||0) * unitsPerBox) + Number(afterPiece||0)) * Number(unitPricePiece||0);
-
-  const warehouseCode = await getWarehouseCodeForLabel(warehouseLabel);
-
-  const row = {
-    product_sku: skuKey(sku),
-    product_name: name,
-    in_box: 0,
-    in_piece: 0,
-    out_box: Number(qtyBox||0),
-    out_piece: Number(qtyPiece||0),
-    stock_box: Number(afterBox ?? 0),
-    stock_piece: Number(afterPiece ?? 0),
-    in_amount: 0,
-    out_amount: Number(outAmount||0),
-    stock_amount: Number(stockAmount||0),
-    created_at: new Date().toISOString(),
-    group_code: String(branch||'').trim().toLowerCase(),
-    source: 'LINE',
-    user_id: userId || null,
-    warehouse_name: warehouseLabel,
-    warehouse_code: warehouseCode
+  const args = {
+    p_group:          String(branch||'').trim().toLowerCase(),
+    p_sku:            skuKey(sku),
+    p_warehouse_name: String(warehouseLabel||'未指定').trim(),
+    p_out_box:        String(outBox ?? ''),   // 允許 ''，由 safe_num 接
+    p_out_piece:      String(outPiece ?? ''), // 允許 ''，由 safe_num 接
+    p_user_id:        authUuid,
+    p_source:         'LINE',
+    p_at:             new Date().toISOString()
   };
 
-  const { error } = await supabase.from('inventory_running').insert([row]);
+  const { data, error } = await supabase.rpc('fifo_out_and_log', args);
   if (error) throw error;
+
+  const row = Array.isArray(data) ? data[0] : data;
+  return {
+    productName: row?.product_name || sku,
+    unitsPerBox: Number(row?.units_per_box || 1) || 1,
+    unitPricePiece: Number(row?.unit_price_piece || 0),
+    outBox: Number(row?.out_box || 0),
+    outPiece: Number(row?.out_piece || 0),
+    afterBox: Number(row?.after_box || 0),
+    afterPiece: Number(row?.after_piece || 0),
+    warehouseName: String(row?.warehouse_name || warehouseLabel || '未指定')
+  };
 }
 
 /* ======== GAS Webhook (optional, idempotent) ======== */
@@ -509,85 +475,49 @@ async function handleEvent(event){
       const wh = await resolveWarehouseLabel(parsed.warehouse || '未指定');
       LAST_WAREHOUSE_BY_USER_BRANCH.set(`${lineUserId}::${branch}`, wh);
 
-      // 出庫前快照（以 lots 為準）
-      const beforeSnap = await getWarehouseSnapshotFromLots(branch, skuLast, wh);
-
-      // 嚴格箱對箱、散對散檢查（不做單位轉換）
-      if (parsed.box > 0 && parsed.box > (beforeSnap.box||0)) { await replyText(`庫存不足：該倉僅有 ${beforeSnap.box}箱`); return; }
-      if (parsed.piece > 0 && parsed.piece > (beforeSnap.piece||0)) { await replyText(`庫存不足：該倉僅有 ${beforeSnap.piece}件`); return; }
-
       try {
-        // FIFO 扣庫
-        let boxCostFromFifo = null;
-        let pieceCostFromFifo = null;
-
-        if (parsed.box>0) {
-          const rBox = await callFifoOutLots(branch, skuLast, 'box',   parsed.box,   wh, lineUserId);
-          boxCostFromFifo = Number(rBox.cost||0); // 可能是每箱成本
-        }
-        if (parsed.piece>0) {
-          const rPiece = await callFifoOutLots(branch, skuLast, 'piece', parsed.piece, wh, lineUserId);
-          pieceCostFromFifo = Number(rPiece.cost||0); // 每件成本
-        }
-
-        // 取箱入數（決定是否需要把箱成本換算成件成本以供金額計算）
-        const { data: prodRowX } = await supabase.from('products').select('箱入數, 貨品名稱').ilike('貨品編號', skuLast).maybeSingle();
-        const unitsPerBoxX = Number(prodRowX?.['箱入數'] || 1) || 1;
-        const prodName = prodRowX?.['貨品名稱'] || skuLast;
-
-        // 出庫單價(散)：若有散成本 → 用散；否則把箱成本 / 箱入數；最後退而求其次用 lots 顯示價
-        const snapBefore = await getWarehouseSnapshotFromLots(branch, skuLast, wh);
-        let unitPricePiece =
-          (pieceCostFromFifo ?? (boxCostFromFifo != null ? (boxCostFromFifo / unitsPerBoxX) : null) ?? Number(snapBefore.displayUnitCost||0));
-
-        // 不重查：用快照-本次出庫
-        const afterBox   = Math.max(0, (snapBefore.box||0)   - (parsed.box||0));
-        const afterPiece = Math.max(0, (snapBefore.piece||0) - (parsed.piece||0));
-
-        // 寫入 inventory_running（★ 關鍵差異：取代 inventory_logs）
-        const authUuid = await resolveAuthUuidFromLineUserId(lineUserId);
-        await insertInventoryRunningOut({
-          branch,
-          sku: skuLast,
+        // ★ 單一 RPC：同一交易扣庫＋寫流水；任何錯誤 → 回滾
+        const result = await callOutOnceTx({
+          branch, sku: skuLast,
+          outBox: parsed.box||0,
+          outPiece: parsed.piece||0,
           warehouseLabel: wh,
-          unitPricePiece,
-          qtyBox: parsed.box||0,
-          qtyPiece: parsed.piece||0,
-          userId: authUuid,
-          afterBox,
-          afterPiece
+          lineUserId
         });
 
         // 使用者回覆
         await replyText(
           `✅ 出庫成功\n` +
-          `品名：${prodName}\n` +
+          `品名：${result.productName}\n` +
           `編號：${skuLast}\n` +
-          `倉別：${wh}\n` +
-          `出庫：${parsed.box||0}箱 ${parsed.piece||0}件\n` +
-          `👉目前庫存：${afterBox}箱${afterPiece}散`
+          `倉別：${result.warehouseName}\n` +
+          `出庫：${result.outBox}箱 ${result.outPiece}件\n` +
+          `👉目前庫存：${result.afterBox}箱${result.afterPiece}散`
         );
 
-        // 推 GAS（以 RPC 重繪當日分頁）
+        // 推 GAS（以回傳資料重繪）
         try {
-          const outAmountForGas = (Number(parsed.box||0)*unitsPerBoxX + Number(parsed.piece||0)) * Number(unitPricePiece||0);
-          const stockAmountForGas = ((afterBox*unitsPerBoxX)+afterPiece) * Number(unitPricePiece||0);
+          const outAmountForGas =
+            (Number(result.outBox||0)*result.unitsPerBox + Number(result.outPiece||0)) * Number(result.unitPricePiece||0);
+          const stockAmountForGas =
+            ((Number(result.afterBox||0)*result.unitsPerBox)+Number(result.afterPiece||0)) * Number(result.unitPricePiece||0);
+
           const payload = {
             type: 'log',
             group: String(branch||'').trim().toLowerCase(),
             sku: skuDisplay(skuLast),
-            name: prodName,
-            units_per_box: unitsPerBoxX,
-            unit_price: Number(unitPricePiece||0),
+            name: result.productName,
+            units_per_box: result.unitsPerBox,
+            unit_price: Number(result.unitPricePiece||0),
             in_box: 0,
             in_piece: 0,
-            out_box: Number(parsed.box||0),
-            out_piece: Number(parsed.piece||0),
-            stock_box: afterBox,
-            stock_piece: afterPiece,
+            out_box: Number(result.outBox||0),
+            out_piece: Number(result.outPiece||0),
+            stock_box: Number(result.afterBox||0),
+            stock_piece: Number(result.afterPiece||0),
             out_amount: outAmountForGas,
             stock_amount: stockAmountForGas,
-            warehouse: wh,
+            warehouse: result.warehouseName,
             created_at: tpeNowISO()
           };
           await postInventoryToGAS(payload);
