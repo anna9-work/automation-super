@@ -8,7 +8,7 @@ import { createClient } from '@supabase/supabase-js';
  *  LINE Bot for Inventory (Single-TX Outbound)
  *  - 出庫：呼叫一個 RPC ⇒ 同一交易完成 FIFO 扣庫 + 寫流水
  *  - 入庫：請用 App
- *  - GAS webhook：維持由 Node 成功後再推（DB 成功才推）
+ *  - GAS webhook：DB 成功才推（以 RPC 回傳值為準）
  * =========================================================
  */
 
@@ -294,7 +294,8 @@ async function callOutOnceTx({ branch, sku, outBox, outPiece, warehouseLabel, li
     outPiece: Number(row?.out_piece || 0),
     afterBox: Number(row?.after_box || 0),
     afterPiece: Number(row?.after_piece || 0),
-    warehouseName: String(row?.warehouse_name || warehouseLabel || '未指定')
+    warehouseName: String(row?.warehouse_name || warehouseLabel || '未指定'),
+    stockAmount: Number(row?.stock_amount || 0)   // ★ 以 DB 回傳為準
   };
 }
 
@@ -495,12 +496,10 @@ async function handleEvent(event){
           `👉目前庫存：${result.afterBox}箱${result.afterPiece}散`
         );
 
-        // 推 GAS（以回傳資料重繪）
+        // 推 GAS（以回傳資料重繪；庫存金額使用 DB 計算值）
         try {
           const outAmountForGas =
             (Number(result.outBox||0)*result.unitsPerBox + Number(result.outPiece||0)) * Number(result.unitPricePiece||0);
-          const stockAmountForGas =
-            ((Number(result.afterBox||0)*result.unitsPerBox)+Number(result.afterPiece||0)) * Number(result.unitPricePiece||0);
 
           const payload = {
             type: 'log',
@@ -516,7 +515,8 @@ async function handleEvent(event){
             stock_box: Number(result.afterBox||0),
             stock_piece: Number(result.afterPiece||0),
             out_amount: outAmountForGas,
-            stock_amount: stockAmountForGas,
+            stock_amount: Number(result.stockAmount||0),  // ★ 直接用 DB 回傳
+            庫存金額: Number(result.stockAmount||0),        // ★ 若 GAS 讀中文鍵
             warehouse: result.warehouseName,
             created_at: tpeNowISO()
           };
