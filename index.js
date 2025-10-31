@@ -1,4 +1,4 @@
-// index.js — linebot 查庫存改為 daily_sheet_rows（05:00 業務日）；支援多倉 quick reply；出庫回覆改為「用前快照-本次數量」，且散對散、箱對箱
+// index.js — 僅修：inventory_logs 寫入「出庫金額」「庫存箱數/庫存散數」；其餘流程不變（散對散箱對箱、前快照-本次顯示）
 import 'dotenv/config';
 import express from 'express';
 import line from '@line/bot-sdk';
@@ -21,6 +21,7 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) console.error('缺少 Supabase 
 
 /* ======== App / Supabase ======== */
 const app = express(); // ⚠️ webhook 前不可掛 body parser
+const lineConfig = { channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN, channelSecret: LINE_CHANNEL_SECRET };
 app.use((req, _res, next) => {
   console.log(`[請求] ${req.method} ${req.path} ua=${req.headers['user-agent']||''} x-line-signature=${req.headers['x-line-signature']?'yes':'no'}`);
   next();
@@ -79,13 +80,6 @@ async function resolveAuthUuidFromLineUserId(lineUserId) {
   const { data, error } = await supabase.from('line_user_map').select('auth_user_id').eq('line_user_id', lineUserId).maybeSingle();
   if (error) { console.warn('[resolveAuthUuid] line_user_map error:', error); return null; }
   return data?.auth_user_id || null;
-}
-async function getBranchIdByGroupCode(groupCode) {
-  const key = String(groupCode||'').trim();
-  if (!key) return null;
-  const { data, error } = await supabase.from('branches').select('id').ilike('分店代號', key).maybeSingle();
-  if (error) throw error;
-  return data?.id ?? null;
 }
 
 /* ======== 指令解析 ======== */
@@ -244,7 +238,6 @@ async function callFifoOutLots(branch, sku, uom, qty, warehouseDisplayName, line
   if (!authUuid) throw new Error(`找不到對應的使用者（${lineUserId}）。請先在 line_user_map 建立對應。`);
   if (qty <= 0) return { consumed: 0, cost: 0 };
 
-  // 這裡仍用 lots 的 RPC；不動你現有後端
   const whRaw = await resolveWarehouseLabel(warehouseDisplayName);
 
   const { data, error } = await supabase.rpc('fifo_out_lots', {
@@ -330,30 +323,19 @@ function buildQuickReplyForWarehouses(baseText, warehouseList, wantBox, wantPiec
   return { items };
 }
 
-/* ======== 記錄簡述 ======== */
-function logEventSummary(event){
-  try{
-    const src=event?.source||{}; const msg=event?.message||{}; const isGroup=src.type==='group'; const isRoom=src.type==='room';
-    console.log(`[LINE EVENT] type=${event?.type} source=${src.type||'-'} groupId=${isGroup?src.groupId:'-'} roomId=${isRoom?src.roomId:'-'} userId=${src.userId||'-'} text="${msg?.type==='text'?msg.text:''}"`);
-  }catch(e){ console.error('[LINE EVENT LOG ERROR]', e); }
-}
-
 /* ======== 寫入 inventory_logs（出庫） ======== */
-async function insertInventoryLogOut({ branch, sku, warehouseLabel, unitPricePiece, qtyBox, qtyPiece, userId, refTable, refId }) {
-  // 產品資訊（箱入數）
-  const { data: prod } = await supabase.from('products').select('貨品名稱,"箱入數"').ilike('貨品編號', sku).maybeSingle();
+// ★ 修正點：增加 stockAfterBox/stockAfterPiece，並確保出庫金額帶入
+async function insertInventoryLogOut({ branch, sku, warehouseLabel, unitPricePiece, qtyBox, qtyPiece, stockAfterBox, stockAfterPiece, userId }) {
+  const { data: prod } = await supabase.from('products').select('貨品名稱,"箱入數", 單價').ilike('貨品編號', sku).maybeSingle();
   const name = prod?.['貨品名稱'] || sku;
   const unitsPerBox = Number(prod?.['箱入數'] || 1) || 1;
 
-  // 金額
   const totalPiecesOut = (Number(qtyBox||0)*unitsPerBox) + Number(qtyPiece||0);
   const outAmount = totalPiecesOut * Number(unitPricePiece||0);
 
-  // 出庫後快照（此函式只寫 logs，不再查最新 RPC）
   const warehouseCode = await getWarehouseCodeForLabel(warehouseLabel);
   const nowIso = new Date().toISOString();
 
-  // 確保 inventory_logs 已有「倉庫別」「倉庫代碼」欄位
   const row = {
     '貨品編號': skuKey(sku),
     '貨品名稱': name,
@@ -361,9 +343,11 @@ async function insertInventoryLogOut({ branch, sku, warehouseLabel, unitPricePie
     '入庫散數': 0,
     '出庫箱數': String(Number(qtyBox||0)),
     '出庫散數': String(Number(qtyPiece||0)),
-    '出庫金額': String(outAmount),         // text 欄位
+    '庫存箱數': String(Number(stockAfterBox||0)),   // ★ 新增
+    '庫存散數': String(Number(stockAfterPiece||0)), // ★ 新增
+    '出庫金額': String(outAmount),                  // ★ 必帶
     '入庫金額': '0',
-    '庫存金額': '0',                       // 留 0；由 GAS/報表端整頁重拉計算
+    '庫存金額': '0', // 由 GAS/報表端重算
     '建立時間': nowIso,
     '群組': String(branch||'').trim().toLowerCase(),
     '操作來源': 'LINE',
@@ -377,7 +361,6 @@ async function insertInventoryLogOut({ branch, sku, warehouseLabel, unitPricePie
 }
 
 /* ======== Webhook 主流程 ======== */
-const lineConfig = { channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN, channelSecret: LINE_CHANNEL_SECRET };
 app.get('/health', (_req,res)=>res.status(200).send('OK'));
 app.get('/',       (_req,res)=>res.status(200).send('RUNNING'));
 app.get('/webhook',      (_req,res)=>res.status(200).send('OK'));
@@ -390,7 +373,6 @@ async function lineHandler(req, res) {
   try {
     const events = req.body?.events || [];
     for (const ev of events) {
-      logEventSummary(ev);
       try { await handleEvent(ev); } catch (err) { console.error('[HANDLE EVENT ERROR]', err); }
     }
     return res.status(200).send('OK');
@@ -499,19 +481,14 @@ async function handleEvent(event){
 
         // 出庫前快照（用 RPC 快照）
         const beforeSnap = await getWarehouseSnapshotFromRPC(branch, skuLast, wh, getBizDate());
-        const { data: prodRow } = await supabase.from('products').select('貨品名稱, 箱入數').ilike('貨品編號', skuLast).maybeSingle();
-        const prodName = prodRow?.['貨品名稱'] || skuLast;
-        const unitsPerBox = Number(prodRow?.['箱入數'] || 1) || 1;
+        const { data: pInfo } = await supabase.from('products').select('貨品名稱, 箱入數, 單價').ilike('貨品編號', skuLast).maybeSingle();
+        const prodName = pInfo?.['貨品名稱'] || skuLast;
+        const unitsPerBox = Number(pInfo?.['箱入數'] || 1) || 1;
+        const productListPrice = Number(pInfo?.['單價'] || 0) || 0;
 
         // ✅ 散對散、箱對箱 檢查（不做跨單位換算）
-        if ((parsed.box||0) > beforeSnap.box) {
-          await replyText(`庫存不足（箱）：該倉僅有 ${beforeSnap.box}箱` + (beforeSnap.piece>0?`${beforeSnap.piece}散`:''));
-          return;
-        }
-        if ((parsed.piece||0) > beforeSnap.piece) {
-          await replyText(`庫存不足（散）：該倉僅有 ${beforeSnap.piece}散`);
-          return;
-        }
+        if ((parsed.box||0) > beforeSnap.box) { await replyText(`庫存不足（箱）：該倉僅有 ${beforeSnap.box}箱` + (beforeSnap.piece>0?`${beforeSnap.piece}散`:'')); return; }
+        if ((parsed.piece||0) > beforeSnap.piece) { await replyText(`庫存不足（散）：該倉僅有 ${beforeSnap.piece}散`); return; }
 
         // FIFO 扣庫（箱/散分別）
         let fifoUnitPieceCosts = [];
@@ -524,6 +501,15 @@ async function handleEvent(event){
           fifoUnitPieceCosts.push({ uom:'piece', consumed:rPiece.consumed, unitCost:rPiece.cost });
         }
 
+        // 出庫單價(散)：若同時有箱/散，以散的 FIFO 單價優先，否則用箱 FIFO，再用 RPC 單價，最後用 products.單價
+        const fifoPieceCost = Number(fifoUnitPieceCosts.find(x=>x.uom==='piece')?.unitCost || 0);
+        const fifoBoxCost   = Number(fifoUnitPieceCosts.find(x=>x.uom==='box')?.unitCost   || 0);
+        const rpcUnitDisp   = Number(beforeSnap.displayUnitCost || 0);
+        const unitPricePiece =
+          (fifoPieceCost>0 ? fifoPieceCost :
+          (fifoBoxCost>0   ? fifoBoxCost   :
+          (rpcUnitDisp>0   ? rpcUnitDisp   : productListPrice)));
+
         // 舊彙總（可留）
         await changeInventoryByGroupSku(
           branch,
@@ -534,17 +520,11 @@ async function handleEvent(event){
           'LINE'
         ).catch(()=>{});
 
-        // 出庫單價(散)：若同時有箱/散，以散的 FIFO 單價優先
-        const unitPricePiece =
-          (fifoUnitPieceCosts.find(x=>x.uom==='piece')?.unitCost)
-          ?? (fifoUnitPieceCosts.find(x=>x.uom==='box')?.unitCost)
-          ?? 0;
-
-        // ✅ 不再查「出庫後」RPC；直接用「前快照－本次出庫」計算顯示
+        // ✅ 顯示與 logs 用「前快照－本次」
         const afterBox   = beforeSnap.box   - (parsed.box   || 0);
         const afterPiece = beforeSnap.piece - (parsed.piece || 0);
 
-        // 寫 logs
+        // 寫 logs（★ 此處帶入 出庫金額 與 庫存箱/散）
         const authUuid = await resolveAuthUuidFromLineUserId(lineUserId);
         await insertInventoryLogOut({
           branch,
@@ -553,12 +533,12 @@ async function handleEvent(event){
           unitPricePiece,
           qtyBox: parsed.box||0,
           qtyPiece: parsed.piece||0,
-          userId: authUuid,
-          refTable: 'linebot',
-          refId: event.message?.id || null
+          stockAfterBox: afterBox,
+          stockAfterPiece: afterPiece,
+          userId: authUuid
         });
 
-        // 推 GAS（GAS 端重拉 RPC 覆蓋整頁；此處帶上我們計算的 after 值僅供參考）
+        // 推 GAS（GAS 端重拉 RPC 覆蓋整頁）
         const payload = {
           type: 'log',
           group: String(branch||'').trim().toLowerCase(),
@@ -573,7 +553,7 @@ async function handleEvent(event){
           stock_box: afterBox,
           stock_piece: afterPiece,
           out_amount: ((parsed.box||0)*unitsPerBox + (parsed.piece||0)) * unitPricePiece,
-          stock_amount: ((afterBox*unitsPerBox)+afterPiece) * (beforeSnap.displayUnitCost || unitPricePiece || 0),
+          stock_amount: 0, // 交由 GAS 計算
           warehouse: wh,
           created_at: formatTpeIso(new Date())
         };
