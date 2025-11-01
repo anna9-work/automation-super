@@ -143,7 +143,6 @@ async function autoRegisterUser(lineUserId) {
 }
 
 /* ======== 業務日結存：統一查詢 RPC（與試算表一致） ======== */
-/* 取「業務日結存」清單（替換原 lots 聚合） */
 async function getWarehouseStockBySku(branch, sku) {
   const group = String(branch||'').trim().toLowerCase();
   const s = String(sku||'').trim();
@@ -161,8 +160,6 @@ async function getWarehouseStockBySku(branch, sku) {
     unitPricePiece: Number(r.unit_price_piece||0),
   })).filter(w => (w.box>0 || w.piece>0));
 }
-
-/* 取「業務日結存」單倉快照（替換原 lots 快照） */
 async function getWarehouseSnapshotFromLots(branch, sku, warehouseDisplayName) {
   const group = String(branch||'').trim().toLowerCase();
   const s = String(sku||'').trim();
@@ -181,7 +178,7 @@ async function getWarehouseSnapshotFromLots(branch, sku, warehouseDisplayName) {
   const piece = Number(row.piece||0);
   const unitsPerBox = Number(row.units_per_box||1) || 1;
   const unitPricePiece = Number(row.unit_price_piece||0);
-  const stockAmount = ((box*unitsPerBox) + piece) * unitPricePiece;
+  const stockAmount = ((box*unitsPerBox) + piece) * unitPricePiece; // 僅為金額顯示；數量仍箱散分離
 
   return { box, piece, stockAmount, displayUnitCost: unitPricePiece, unitsPerBox };
 }
@@ -418,7 +415,7 @@ async function handleEvent(event){
 
   const { branch, role, blocked, needBindMsg } = await resolveBranchAndRole(event);
   if (blocked) return;
-  if (!branch) { await client.replyMessage(event.replyToken, { type:'text', text: needBindMsg || '尚未分店綁定，請管理員設定' }); return; }
+  if (!branch) { await client.replyMessage(event.replyToken, { type:'text', text: needBindMsg || '此使用者尚未綁定分店，請管理員設定' }); return; }
 
   const reply = (msg) => client.replyMessage(event.replyToken, msg);
   const replyText = (s) => reply({ type:'text', text:s });
