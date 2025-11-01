@@ -6,10 +6,11 @@ import { createClient } from '@supabase/supabase-js';
 /**
  * =========================================================
  *  LINE Bot for Inventory (Single-TX Outbound + 統一業務日結存)
- *  - 出庫：呼叫一個 RPC ⇒ 同一交易完成 FIFO 扣庫 + 寫流水（失敗整筆回滾）
- *  - 入庫：請用 App
+ *  - 出庫：呼叫一個 RPC ⇒ 同一交易完成 FIFO 扣庫 + 寫事件流水 + 更新即時快照
+ *  - 入庫：請用 App（本 Bot 僅處理出庫）
  *  - 查庫存/快照：走 RPC get_business_day_stock（與試算表一致，台北 05:00 分界）
  *  - GAS webhook：DB 成功才推（以 RPC 回傳值為準）
+ *  - 箱對箱、散對散；不做單位換算
  * =========================================================
  */
 
@@ -95,6 +96,13 @@ async function resolveWarehouseLabel(codeOrName) {
     WAREHOUSE_NAME_CACHE.set(key, label);
     return label;
   } catch { return key; }
+}
+async function getWarehouseCodeForLabel(displayName) {
+  const label = String(displayName||'').trim();
+  for (const [code, cn] of FIX_WH_LABEL.entries()) if (cn === label) return code;
+  const { data } = await supabase.from('inventory_warehouses').select('code,name').or(`name.eq.${label},code.eq.${label}`).limit(1).maybeSingle();
+  if (data?.code) return data.code;
+  return 'unspecified';
 }
 
 /* ======== Branch & User ======== */
@@ -309,7 +317,7 @@ async function callOutOnceTx({ branch, sku, outBox, outPiece, warehouseLabel, li
     afterBox: Number(row?.after_box || 0),
     afterPiece: Number(row?.after_piece || 0),
     warehouseName: String(row?.warehouse_name || warehouseLabel || '未指定'),
-    stockAmount: Number(row?.stock_amount || 0)   // ★ 以 DB 回傳為準
+    stockAmount: Number(row?.stock_amount || 0)   // ★ 以 DB 回傳為準（即時快照金額）
   };
 }
 
@@ -491,7 +499,7 @@ async function handleEvent(event){
       LAST_WAREHOUSE_BY_USER_BRANCH.set(`${lineUserId}::${branch}`, wh);
 
       try {
-        // ★ 單一 RPC：同一交易扣庫＋寫流水；任何錯誤 → 回滾
+        // ★ 單一 RPC：同一交易扣庫＋寫流水＋刷新即時快照；任何錯誤 → 回滾
         const result = await callOutOnceTx({
           branch, sku: skuLast,
           outBox: parsed.box||0,
