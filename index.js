@@ -5,9 +5,9 @@ import { createClient } from '@supabase/supabase-js';
 
 /**
  * =========================================================
- *  LINE Bot for Inventory（查庫存走 app.get_business_day_stock）
- *  - 出庫：沿用你現有的 fifo_out_and_log（單一交易）
- *  - 查庫存/快照：app.get_business_day_stock（05:00 分界、與試算表一致）
+ *  LINE Bot for Inventory（查庫存走 public.get_business_day_stock）
+ *  - 出庫：fifo_out_and_log（單一交易）
+ *  - 查庫存/快照：public.get_business_day_stock（05:00 分界、與試算表一致）
  *  - 倉庫字典：warehouse_kinds(kind_id, kind_name)
  *  - 箱對箱、散對散；不做單位換算
  * =========================================================
@@ -170,7 +170,7 @@ async function getWarehouseStockBySku(branch, sku) {
   if (!group || !s) return [];
   const bizDate = getBizDateTodayTPE();
 
-  const { data, error } = await supabase.rpc('app.get_business_day_stock', {
+  const { data, error } = await supabase.rpc('get_business_day_stock', {
     p_group: group,
     p_biz_date: bizDate,
     p_sku: s,
@@ -179,11 +179,15 @@ async function getWarehouseStockBySku(branch, sku) {
   if (error) throw error;
 
   const rows = Array.isArray(data) ? data : [];
-  return rows.map(r => ({
-    warehouse: String(r.warehouse_name || '未指定'),
-    box: Number(r['庫存箱數'] ?? r.end_box ?? 0),
-    piece: Number(r['庫存散數'] ?? r.end_piece ?? 0),
-  })).filter(w => (w.box>0 || w.piece>0));
+  return rows
+    .map(r => ({
+      warehouse: String(r.warehouse_name || '未指定'),
+      box: Number(r.box || 0),
+      piece: Number(r.piece || 0),
+      unitsPerBox: Number(r.units_per_box || 1),
+      unitPricePiece: Number(r.unit_price_piece || 0),
+    }))
+    .filter(w => (w.box>0 || w.piece>0));
 }
 
 async function getWarehouseSnapshot(branch, sku, warehouseDisplayName) {
@@ -192,7 +196,7 @@ async function getWarehouseSnapshot(branch, sku, warehouseDisplayName) {
   const whCode = await getWarehouseCodeForLabel(warehouseDisplayName||'未指定');
   const bizDate = getBizDateTodayTPE();
 
-  const { data, error } = await supabase.rpc('app.get_business_day_stock', {
+  const { data, error } = await supabase.rpc('get_business_day_stock', {
     p_group: group,
     p_biz_date: bizDate,
     p_sku: s,
@@ -203,10 +207,13 @@ async function getWarehouseSnapshot(branch, sku, warehouseDisplayName) {
   const row = Array.isArray(data) ? data[0] : data;
   if (!row) return { box:0, piece:0, unitsPerBox:1, unitPricePiece:0, stockAmount:0 };
 
-  const box = Number(row['庫存箱數'] ?? row.end_box ?? 0);
-  const piece = Number(row['庫存散數'] ?? row.end_piece ?? 0);
-  // 金額欄目前 daily_sheet_rows 尚為 null，這裡僅以 0 顯示（等你之後開金額再帶）
-  return { box, piece, unitsPerBox: 1, unitPricePiece: 0, stockAmount: 0 };
+  const box = Number(row.box || 0);
+  const piece = Number(row.piece || 0);
+  const unitsPerBox = Number(row.units_per_box || 1);
+  const unitPricePiece = Number(row.unit_price_piece || 0);
+  const stockAmount = ((box * unitsPerBox) + piece) * unitPricePiece;
+
+  return { box, piece, unitsPerBox, unitPricePiece, stockAmount };
 }
 
 /* ======== Product search (products + 業務日結存) ======== */
