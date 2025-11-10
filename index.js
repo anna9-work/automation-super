@@ -588,7 +588,7 @@ async function handleEvent(event) {
   const reply = (msg) => client.replyMessage(event.replyToken, msg);
   const replyText = (s) => reply({ type: 'text', text: s });
 
-  // 倉庫選擇（使用者輸入「倉XXX」）
+  // ========== 倉庫選擇（使用者輸入「倉XXX」） ==========
   if (parsed.type === 'wh_select') {
     const sku = await getLastSku(lineUserId, branch);
     if (!sku) {
@@ -608,12 +608,16 @@ async function handleEvent(event) {
     const unitsPerBox = Number(prodRow?.['箱入數'] || 1) || 1;
     const price = Number(prodRow?.['單價'] || 0);
     await replyText(
-      `品名：${name}\n編號：${sku}\n箱入數：${unitsPerBox}\n單價：${price}\n庫存：${snap.box}箱${snap.piece}散`,
+      `品名：${name}
+編號：${sku}
+箱入數：${unitsPerBox}
+單價：${price}
+庫存：${snap.box}箱${snap.piece}散`,
     );
     return;
   }
 
-  // 查詢（products + 業務日結存）
+  // ========== 查詢（products + 業務日結存）共用邏輯 ==========
   const doQueryCommon = async (p) => {
     const sku = p['貨品編號'];
     const whList = await getWarehouseStockBySku(branch, sku);
@@ -623,15 +627,22 @@ async function handleEvent(event) {
     }
     await upsertUserLastProduct(lineUserId, branch, sku);
 
+    // 多倉：先讓使用者選倉庫（只問這一次）
     if (whList.length >= 2) {
       await reply({
         type: 'text',
-        text: `名稱：${p['貨品名稱']}\n編號：${sku}\n👉請選擇倉庫`,
+        text: `名稱：${p['貨品名稱']}
+編號：${sku}
+👉請選擇倉庫`,
         quickReply: buildQuickReplyForWarehousesForQuery(whList),
       });
       return;
     }
+
+    // 只有一個倉庫：直接顯示，並記錄最後使用倉庫
     const chosen = whList[0];
+    LAST_WAREHOUSE_BY_USER_BRANCH.set(`${lineUserId}::${branch}`, chosen.warehouse);
+
     const { data: prodRow } = await supabase
       .from('products')
       .select('貨品名稱, 箱入數, 單價')
@@ -641,10 +652,16 @@ async function handleEvent(event) {
     const unitsPerBox = Number(prodRow?.['箱入數'] || 1) || 1;
     const price = Number(prodRow?.['單價'] || 0);
     await replyText(
-      `名稱：${name}\n編號：${sku}\n箱入數：${unitsPerBox}\n單價：${price}\n倉庫類別：${chosen.warehouse}\n庫存：${chosen.box}箱${chosen.piece}散`,
+      `名稱：${name}
+編號：${sku}
+箱入數：${unitsPerBox}
+單價：${price}
+倉庫類別：${chosen.warehouse}
+庫存：${chosen.box}箱${chosen.piece}散`,
     );
   };
 
+  // ========== 查詢：關鍵字 ==========
   if (parsed.type === 'query') {
     const list = await searchByName(parsed.keyword, role, branch);
     if (!list.length) {
@@ -662,6 +679,7 @@ async function handleEvent(event) {
     await doQueryCommon(list[0]);
     return;
   }
+  // ========== 查詢：條碼 ==========
   if (parsed.type === 'barcode') {
     const list = await searchByBarcode(parsed.barcode, role, branch);
     if (!list.length) {
@@ -671,6 +689,7 @@ async function handleEvent(event) {
     await doQueryCommon(list[0]);
     return;
   }
+  // ========== 查詢：貨品編號 ==========
   if (parsed.type === 'sku') {
     const list = await searchBySku(parsed.sku, role, branch);
     if (!list.length) {
@@ -689,8 +708,9 @@ async function handleEvent(event) {
     return;
   }
 
-  // 入/出庫
+  // ========== 入/出庫 ==========
   if (parsed.type === 'change') {
+    // 入庫權限限制
     if (parsed.action === 'in' && role !== '主管') {
       await replyText('您無法使用「入庫」');
       return;
@@ -703,6 +723,7 @@ async function handleEvent(event) {
       return;
     }
 
+    // ========= 出庫 =========
     if (parsed.action === 'out') {
       const outBox = parsed.box || 0;
       const outPiece = parsed.piece || 0;
@@ -714,18 +735,32 @@ async function handleEvent(event) {
         return;
       }
 
-      // 如果使用者沒有指定 @倉庫，而且有多倉 -> 一律請選倉庫
+      // 先看「上一個使用的倉庫」
+      const lastWhKey = `${lineUserId || ''}::${branch}`;
+      const lastWhLabel = LAST_WAREHOUSE_BY_USER_BRANCH.get(lastWhKey) || null;
+
       if (!parsed.warehouse) {
-        if (whList.length >= 2) {
-          await reply({
-            type: 'text',
-            text: '請選擇要出庫的倉庫',
-            quickReply: buildQuickReplyForWarehouses('出', whList, outBox, outPiece),
-          });
-          return;
+        // 如果有上一次選的倉庫，且此商品在該倉仍有庫存，就直接用它，不再跳倉庫選單
+        if (lastWhLabel) {
+          const matched = whList.find((w) => w.warehouse === lastWhLabel);
+          if (matched) {
+            parsed.warehouse = lastWhLabel;
+          }
         }
-        // 只剩一個倉庫有庫存 → 自動選那個
-        parsed.warehouse = whList[0].warehouse;
+
+        // 沒有上一次倉庫、或該倉沒庫存了 → 再看要不要請選倉庫
+        if (!parsed.warehouse) {
+          if (whList.length >= 2) {
+            await reply({
+              type: 'text',
+              text: '請選擇要出庫的倉庫',
+              quickReply: buildQuickReplyForWarehouses('出', whList, outBox, outPiece),
+            });
+            return;
+          }
+          // 只剩一個倉庫有庫存 → 自動選那個
+          parsed.warehouse = whList[0].warehouse;
+        }
       }
 
       const wh = await resolveWarehouseLabel(parsed.warehouse || '未指定');
@@ -737,11 +772,13 @@ async function handleEvent(event) {
       const curPiece = snap.piece || 0;
 
       if (outBox > 0 && curBox < outBox) {
-        await replyText(`庫存不足，無法出庫（倉別：${wh}）\n目前庫存：${curBox}箱${curPiece}散`);
+        await replyText(`庫存不足，無法出庫（倉別：${wh}）
+目前庫存：${curBox}箱${curPiece}散`);
         return;
       }
       if (outPiece > 0 && curPiece < outPiece) {
-        await replyText(`庫存不足，無法出庫（倉別：${wh}）\n目前庫存：${curBox}箱${curPiece}散`);
+        await replyText(`庫存不足，無法出庫（倉別：${wh}）
+目前庫存：${curBox}箱${curPiece}散`);
         return;
       }
 
@@ -764,11 +801,16 @@ async function handleEvent(event) {
         }
 
         await replyText(
-          `✅ 出庫成功\n` +
-            `品名：${result.productName}\n` +
-            `編號：${skuLast}\n` +
-            `倉別：${result.warehouseName}\n` +
-            `出庫：${result.outBox}箱 ${result.outPiece}件\n` +
+          `✅ 出庫成功
+` +
+            `品名：${result.productName}
+` +
+            `編號：${skuLast}
+` +
+            `倉別：${result.warehouseName}
+` +
+            `出庫：${result.outBox}箱 ${result.outPiece}件
+` +
             `👉目前庫存：${result.afterBox}箱${result.afterPiece}散`,
         );
 
@@ -808,7 +850,7 @@ async function handleEvent(event) {
       }
     }
 
-    // 入庫還是走 App
+    // ========= 入庫（目前不開放 LINE 操作） =========
     await replyText('入庫請改用 App 進行；LINE 僅提供出庫');
     return;
   }
