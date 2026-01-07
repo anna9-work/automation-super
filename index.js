@@ -455,11 +455,16 @@ async function callOutOnceTx({ branch, sku, outBox, outPiece, warehouseLabel, li
 let GAS_URL_CACHE = (ENV_GAS_URL || '').trim();
 let GAS_SECRET_CACHE = (ENV_GAS_SECRET || '').trim();
 let GAS_LOADED_ONCE = false;
-async function loadGasConfigFromDBIfNeeded() {
-  if (GAS_URL_CACHE && GAS_SECRET_CACHE) {
-    GAS_LOADED_ONCE = true;
+let GAS_LAST_LOAD_MS = 0; // 重新讀設定的時間戳
+
+// 每次需要時、或每隔 5 分鐘，從 DB 重新載入 gas_webhook_url / gas_webhook_secret
+async function loadGasConfigFromDBIfNeeded(force = false) {
+  const now = Date.now();
+  const hasCache = GAS_URL_CACHE && GAS_SECRET_CACHE;
+  if (!force && hasCache && GAS_LOADED_ONCE && now - GAS_LAST_LOAD_MS < 5 * 60 * 1000) {
     return;
   }
+
   try {
     const { data, error } = await supabase.rpc('get_app_settings', {
       keys: ['gas_webhook_url', 'gas_webhook_secret'],
@@ -474,23 +479,30 @@ async function loadGasConfigFromDBIfNeeded() {
       }
     }
     GAS_LOADED_ONCE = true;
+    GAS_LAST_LOAD_MS = now;
+    console.log('[GAS CONFIG] url =', GAS_URL_CACHE ? GAS_URL_CACHE.slice(0, 80) : '(empty)');
   } catch (e) {
     GAS_LOADED_ONCE = true;
+    GAS_LAST_LOAD_MS = now;
     console.warn('⚠️ 載入 GAS 設定失敗（RPC get_app_settings）：', e?.message || e);
   }
 }
+
 async function getGasConfig() {
-  if (!GAS_LOADED_ONCE || !GAS_URL_CACHE || !GAS_SECRET_CACHE) await loadGasConfigFromDBIfNeeded();
+  if (!GAS_LOADED_ONCE || !GAS_URL_CACHE || !GAS_SECRET_CACHE) await loadGasConfigFromDBIfNeeded(true);
   return { url: GAS_URL_CACHE, secret: GAS_SECRET_CACHE };
 }
+
 async function postInventoryToGAS(payload) {
   const { url, secret } = await getGasConfig();
   if (!url || !secret) {
     console.warn('⚠️ GAS 未設定（略過推送）');
     return;
   }
-  const callUrl = `${url.replace(/\?+.*/, '')}?secret=${encodeURIComponent(secret)}`;
+  const cleanBaseUrl = url.replace(/\?.*$/, '');
+  const callUrl = `${cleanBaseUrl}?secret=${encodeURIComponent(secret)}`;
   try {
+    console.log('[GAS CALL]', cleanBaseUrl);
     const res = await fetch(callUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
