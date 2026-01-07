@@ -267,6 +267,7 @@ async function getWarehouseSnapshot(branch, sku, warehouseDisplayName) {
 }
 
 /* ======== Product search (products + 業務日結存) ======== */
+// 關鍵字搜尋：一次撈 products，並行查每個 sku 是否有庫存，只保留前 10 筆
 async function searchByName(keyword, _role, branch) {
   const k = String(keyword || '').trim();
   if (!k) return [];
@@ -276,14 +277,29 @@ async function searchByName(keyword, _role, branch) {
     .ilike('貨品名稱', `%${k}%`)
     .limit(30);
   if (error) throw error;
+  const list = Array.isArray(data) ? data : [];
+  if (!list.length) return [];
+
+  // 並行查庫存，只要有庫存就留下
+  const checks = await Promise.all(
+    list.map(async (p) => {
+      try {
+        const warehouses = await getWarehouseStockBySku(branch, p['貨品編號']);
+        return { p, hasStock: warehouses.length > 0 };
+      } catch {
+        return { p, hasStock: false };
+      }
+    }),
+  );
+
   const filtered = [];
-  for (const p of data || []) {
-    const warehouses = await getWarehouseStockBySku(branch, p['貨品編號']);
-    if (warehouses.length) filtered.push(p);
+  for (const { p, hasStock } of checks) {
+    if (hasStock) filtered.push(p);
     if (filtered.length >= 10) break;
   }
   return filtered;
 }
+
 async function searchByBarcode(barcode, _role, branch) {
   const b = String(barcode || '').trim();
   if (!b) return [];
@@ -297,9 +313,13 @@ async function searchByBarcode(barcode, _role, branch) {
   const warehouses = await getWarehouseStockBySku(branch, data['貨品編號']);
   return warehouses.length ? [data] : [];
 }
+
+// 編號搜尋：先找完全符合，再找 ilike，庫存檢查一樣併發，只保留前 10 筆
 async function searchBySku(sku, _role, branch) {
   const s = String(sku || '').trim();
   if (!s) return [];
+
+  // 先找完全符合
   const { data: exact, error: e1 } = await supabase
     .from('products')
     .select('貨品名稱, 貨品編號, 箱入數, 單價')
@@ -310,16 +330,31 @@ async function searchBySku(sku, _role, branch) {
     const warehouses = await getWarehouseStockBySku(branch, exact['貨品編號']);
     if (warehouses.length) return [exact];
   }
+
+  // 再模糊找
   const { data: like, error: e2 } = await supabase
     .from('products')
     .select('貨品名稱, 貨品編號, 箱入數, 單價')
     .ilike('貨品編號', `%${s}%`)
     .limit(30);
   if (e2) throw e2;
+  const list = Array.isArray(like) ? like : [];
+  if (!list.length) return [];
+
+  const checks = await Promise.all(
+    list.map(async (p) => {
+      try {
+        const warehouses = await getWarehouseStockBySku(branch, p['貨品編號']);
+        return { p, hasStock: warehouses.length > 0 };
+      } catch {
+        return { p, hasStock: false };
+      }
+    }),
+  );
+
   const filtered = [];
-  for (const p of like || []) {
-    const warehouses = await getWarehouseStockBySku(branch, p['貨品編號']);
-    if (warehouses.length) filtered.push(p);
+  for (const { p, hasStock } of checks) {
+    if (hasStock) filtered.push(p);
     if (filtered.length >= 10) break;
   }
   return filtered;
@@ -643,14 +678,11 @@ async function handleEvent(event) {
     const chosen = whList[0];
     LAST_WAREHOUSE_BY_USER_BRANCH.set(`${lineUserId}::${branch}`, chosen.warehouse);
 
-    const { data: prodRow } = await supabase
-      .from('products')
-      .select('貨品名稱, 箱入數, 單價')
-      .ilike('貨品編號', sku)
-      .maybeSingle();
-    const name = prodRow?.['貨品名稱'] || sku;
-    const unitsPerBox = Number(prodRow?.['箱入數'] || 1) || 1;
-    const price = Number(prodRow?.['單價'] || 0);
+    // 這裡直接用 p 內建欄位，避免再查一次 products
+    const name = p['貨品名稱'] || sku;
+    const unitsPerBox = Number(p['箱入數'] || 1) || 1;
+    const price = Number(p['單價'] || 0);
+
     await replyText(
       `名稱：${name}
 編號：${sku}
