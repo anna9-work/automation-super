@@ -619,45 +619,50 @@ async function getLastSku(lineUserId, branch) {
 
 /* ======== Main Handler ======== */
 async function lineHandler(req, res) {
-  // ✅ 先回 200，避免 LINE 判定超時重送
+  // ✅ 立刻印出「收到 webhook」(用 stdout 直接寫，比 console.log 更不容易被延後顯示)
+  process.stdout.write(`[WEBHOOK IN] ${new Date().toISOString()} path=${req.path}\n`);
+
+  // ✅ 先回 200，避免 LINE 超時重送
   res.status(200).send('OK');
 
-  try {
-    const events = req.body?.events || [];
+  // ✅ 把重活丟到下一輪 event loop，避免跟 response/flush 混在一起
+  setImmediate(() => {
+    try {
+      const events = req.body?.events || [];
 
-    // 背景處理（不要 await 卡住 response）
-    const tasks = events.map(async (ev) => {
-      logEventSummary(ev);
+      const tasks = events.map(async (ev) => {
+        logEventSummary(ev);
 
-      // ✅ 去重：LINE 重送的同一則訊息直接略過
-      if (isDuplicateAndMark(ev)) {
-        console.log('[DEDUPED] skip duplicated event');
-        return;
-      }
+        if (isDuplicateAndMark(ev)) {
+          process.stdout.write(`[DEDUPED] ${new Date().toISOString()}\n`);
+          return;
+        }
 
-      try {
-        await handleEvent(ev);
-      } catch (err) {
-        console.error('[HANDLE EVENT ERROR]', err);
-        const token = ev.replyToken;
-        if (token) {
-          try {
-            await client.replyMessage(token, {
-              type: 'text',
-              text: `系統忙碌或發生錯誤：${err?.message || '未知錯誤'}`,
-            });
-          } catch (e2) {
-            console.error('[HANDLE EVENT REPLY ERROR]', e2);
+        try {
+          await handleEvent(ev);
+        } catch (err) {
+          console.error('[HANDLE EVENT ERROR]', err);
+          const token = ev.replyToken;
+          if (token) {
+            try {
+              await client.replyMessage(token, {
+                type: 'text',
+                text: `系統忙碌或發生錯誤：${err?.message || '未知錯誤'}`,
+              });
+            } catch (e2) {
+              console.error('[HANDLE EVENT REPLY ERROR]', e2);
+            }
           }
         }
-      }
-    });
+      });
 
-    Promise.allSettled(tasks).catch((e) => console.error('[EVENT TASKS ERROR]', e));
-  } catch (e) {
-    console.error('[WEBHOOK ERROR]', e);
-  }
+      Promise.allSettled(tasks).catch((e) => console.error('[EVENT TASKS ERROR]', e));
+    } catch (e) {
+      console.error('[WEBHOOK ERROR]', e);
+    }
+  });
 }
+
 
 async function handleEvent(event) {
   if (event.type !== 'message' || event.message.type !== 'text') return;
