@@ -48,6 +48,39 @@ const LAST_WAREHOUSE_BY_USER_BRANCH = new Map(); // key=`${userId}::${branch}` -
 const WH_LABEL_CACHE = new Map(); // key: kind_id 或 kind_name → kind_name（中文）
 const WH_CODE_CACHE = new Map(); // key: kind_name（中文） → kind_id（代碼）
 
+/**
+ * ✅ 去重：防 LINE webhook 超時重送造成「要打很多次才會動 / 或重複出庫」
+ * key 優先用 message.id（最穩），沒有就退回 replyToken
+ */
+const DEDUPE_CACHE = new Map(); // key -> ts(ms)
+const DEDUPE_TTL_MS = 10 * 60 * 1000;
+function makeDedupeKey(ev) {
+  const src = ev?.source || {};
+  const msg = ev?.message || {};
+  const user = src.userId || src.groupId || src.roomId || 'unknown';
+  const mid = msg?.id || '';
+  if (mid) return `mid:${user}:${mid}`;
+  const rt = ev?.replyToken || '';
+  if (rt) return `rt:${user}:${rt}`;
+  return null;
+}
+function isDuplicateAndMark(ev) {
+  const key = makeDedupeKey(ev);
+  if (!key) return false;
+  const now = Date.now();
+  const prev = DEDUPE_CACHE.get(key);
+  if (prev && now - prev < DEDUPE_TTL_MS) return true;
+  DEDUPE_CACHE.set(key, now);
+  return false;
+}
+// 簡單清理
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, ts] of DEDUPE_CACHE.entries()) {
+    if (now - ts >= DEDUPE_TTL_MS) DEDUPE_CACHE.delete(k);
+  }
+}, 60 * 1000).unref?.();
+
 /* ======== Fixed warehouse labels (code -> 中文) ======== */
 const FIX_CODE_TO_NAME = new Map([
   ['main_warehouse', '總倉'],
@@ -457,13 +490,10 @@ let GAS_SECRET_CACHE = (ENV_GAS_SECRET || '').trim();
 let GAS_LOADED_ONCE = false;
 let GAS_LAST_LOAD_MS = 0; // 重新讀設定的時間戳
 
-// 每次需要時、或每隔 5 分鐘，從 DB 重新載入 gas_webhook_url / gas_webhook_secret
 async function loadGasConfigFromDBIfNeeded(force = false) {
   const now = Date.now();
   const hasCache = GAS_URL_CACHE && GAS_SECRET_CACHE;
-  if (!force && hasCache && GAS_LOADED_ONCE && now - GAS_LAST_LOAD_MS < 5 * 60 * 1000) {
-    return;
-  }
+  if (!force && hasCache && GAS_LOADED_ONCE && now - GAS_LAST_LOAD_MS < 5 * 60 * 1000) return;
 
   try {
     const { data, error } = await supabase.rpc('get_app_settings', {
@@ -589,12 +619,22 @@ async function getLastSku(lineUserId, branch) {
 
 /* ======== Main Handler ======== */
 async function lineHandler(req, res) {
+  // ✅ 先回 200，避免 LINE 判定超時重送
+  res.status(200).send('OK');
+
   try {
     const events = req.body?.events || [];
 
-    // 每一個 event 都個別 try/catch，錯誤時回一個通用訊息
+    // 背景處理（不要 await 卡住 response）
     const tasks = events.map(async (ev) => {
       logEventSummary(ev);
+
+      // ✅ 去重：LINE 重送的同一則訊息直接略過
+      if (isDuplicateAndMark(ev)) {
+        console.log('[DEDUPED] skip duplicated event');
+        return;
+      }
+
       try {
         await handleEvent(ev);
       } catch (err) {
@@ -613,11 +653,9 @@ async function lineHandler(req, res) {
       }
     });
 
-    await Promise.all(tasks);
-    return res.status(200).send('OK');
+    Promise.allSettled(tasks).catch((e) => console.error('[EVENT TASKS ERROR]', e));
   } catch (e) {
     console.error('[WEBHOOK ERROR]', e);
-    return res.status(500).send('ERR');
   }
 }
 
@@ -767,7 +805,7 @@ async function handleEvent(event) {
       return;
     }
 
-    // 數量為 0 的防呆（避免「出兩箱」這種中文數字沒讀到）
+    // 數量為 0 的防呆
     if (parsed.box === 0 && parsed.piece === 0) {
       const t = (event.message.text || '').trim();
       if (/[箱件個散]/.test(t)) {
@@ -799,9 +837,7 @@ async function handleEvent(event) {
       if (!parsed.warehouse) {
         if (lastWhLabel) {
           const matched = whList.find((w) => w.warehouse === lastWhLabel);
-          if (matched) {
-            parsed.warehouse = lastWhLabel;
-          }
+          if (matched) parsed.warehouse = lastWhLabel;
         }
 
         if (!parsed.warehouse) {
