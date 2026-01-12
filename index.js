@@ -76,27 +76,15 @@ function pickNum(val, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
-/* 業務日：台北 05:00 分界，回傳 'YYYY-MM-DD'（本地） */
+/* ✅ 方案A：業務日 = 台北「今天日期」（不做 05:00 分界；與試算表頁籤一致） */
 function getBizDateTodayTPE() {
-  const now = new Date();
-  const tpe = new Intl.DateTimeFormat('sv-SE', {
+  const tpeDate = new Intl.DateTimeFormat('sv-SE', {
     timeZone: 'Asia/Taipei',
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false,
-  }).format(now); // yyyy-mm-dd HH:mm:ss
-  const [d, hms] = tpe.split(' ');
-  const hh = parseInt(hms.split(':')[0], 10);
-  if (hh < 5) {
-    const dt = new Date(d + 'T00:00:00+08:00');
-    dt.setDate(dt.getDate() - 1);
-    return dt.toISOString().slice(0, 10);
-  }
-  return d;
+  }).format(new Date()); // yyyy-mm-dd
+  return tpeDate;
 }
 
 function tpeNowISO() {
