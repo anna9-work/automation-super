@@ -260,7 +260,11 @@ async function getWarehouseStockBySku(branch, sku) {
   const group = String(branch || '').trim().toLowerCase();
   const s = String(sku || '').trim();
   if (!group || !s) return [];
+
   const bizDate = getBizDateTodayTPE();
+
+  // ✅ 一定印：呼叫前
+  console.log(`[STOCK RPC] ver=V2026-01-12_DEBUG_WHLIST group=${group} bizDate=${bizDate} sku=${s} stage=before`);
 
   const { data, error } = await supabase.rpc('get_business_day_stock', {
     p_group: group,
@@ -268,26 +272,34 @@ async function getWarehouseStockBySku(branch, sku) {
     p_sku: s,
     p_warehouse_code: null,
   });
-  if (error) throw error;
+
+  if (error) {
+    console.log(
+      `[STOCK RPC] ver=V2026-01-12_DEBUG_WHLIST group=${group} bizDate=${bizDate} sku=${s} stage=error msg=${error.message}`,
+    );
+    throw error;
+  }
 
   const rows = Array.isArray(data) ? data : [];
-  const mapped = await Promise.all(
-    rows.map(async (r) => {
-      const code = String(r.warehouse_code || r.warehouse_name || 'unspecified').trim() || 'unspecified';
-      const label = await resolveWarehouseLabel(code);
-      return {
-        warehouseCode: code,
-        warehouseLabel: label,
-        box: Number(r.box || 0),
-        piece: Number(r.piece || 0),
-        unitsPerBox: Number(r.units_per_box || 1),
-        unitPricePiece: Number(r.unit_price_piece || 0),
-      };
-    }),
+  const kept = rows
+    .map((r) => ({
+      warehouse: String(r.warehouse_name || r.warehouse_code || 'unspecified'),
+      warehouse_code: String(r.warehouse_code || ''),
+      box: Number(r.box || 0),
+      piece: Number(r.piece || 0),
+      unitsPerBox: Number(r.units_per_box || 1),
+      unitPricePiece: Number(r.unit_price_piece || 0),
+    }))
+    .filter((w) => w.box > 0 || w.piece > 0);
+
+  // ✅ 一定印：回來後（把每筆倉庫列出來）
+  console.log(
+    `[STOCK RPC] ver=V2026-01-12_DEBUG_WHLIST group=${group} bizDate=${bizDate} sku=${s} stage=after rows=${rows.length} kept=${kept.length} wh=${kept
+      .map((x) => `${x.warehouse_code || x.warehouse}:${x.box}/${x.piece}`)
+      .join(',')}`,
   );
 
-  // 只保留有庫存
-  return mapped.filter((w) => w.box > 0 || w.piece > 0);
+  return kept;
 }
 
 async function getWarehouseSnapshot(branch, sku, warehouseCodeOrLabel) {
