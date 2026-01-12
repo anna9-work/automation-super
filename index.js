@@ -146,9 +146,10 @@ async function getWarehouseCodeForLabel(displayNameOrCode) {
   if (!label) return 'unspecified';
 
   // 若本來就是 code（main/withdraw/...），直接回
+  //（中文不會符合這個 pattern）
   if (/^[a-z0-9_]+$/i.test(label)) {
-    // 但如果是中文，就不會進來
     if (FIX_CODE_TO_NAME.has(label)) return label;
+
     // 不在固定表也先嘗試 DB kind_id
     try {
       const { data } = await supabase
@@ -163,6 +164,7 @@ async function getWarehouseCodeForLabel(displayNameOrCode) {
         return data.kind_id;
       }
     } catch {}
+
     // 還是回原字串當 code（避免被變成 unspecified）
     return label;
   }
@@ -217,6 +219,7 @@ async function resolveBranchAndRole(event) {
   const isGroup = src.type === 'group';
   let role = 'user',
     blocked = false;
+
   if (userId) {
     const { data: u } = await supabase
       .from('users')
@@ -226,6 +229,7 @@ async function resolveBranchAndRole(event) {
     role = u?.角色 || 'user';
     blocked = !!u?.黑名單;
   }
+
   if (isGroup) {
     const { data: lg } = await supabase
       .from('line_groups')
@@ -246,15 +250,16 @@ async function resolveBranchAndRole(event) {
 async function autoRegisterUser(lineUserId) {
   if (!lineUserId) return;
   const { data } = await supabase.from('users').select('user_id').eq('user_id', lineUserId).maybeSingle();
-  if (!data)
+  if (!data) {
     await supabase.from('users').insert({ user_id: lineUserId, 群組: DEFAULT_GROUP, 角色: 'user', 黑名單: false });
+  }
 }
 
 /* ======== 業務日結存：統一查詢 RPC（與試算表一致） ======== */
 /**
- * 這裡開始：全部改用 warehouse_code 當唯一 key
- * - displayLabel：中文倉名（總倉/撤台…）
- * - code：main/withdraw/...
+ * 全部改用 warehouse_code 當唯一 key
+ * - warehouseCode：main/withdraw/...
+ * - warehouseLabel：總倉/撤台/...
  */
 async function getWarehouseStockBySku(branch, sku) {
   const group = String(branch || '').trim().toLowerCase();
@@ -263,7 +268,6 @@ async function getWarehouseStockBySku(branch, sku) {
 
   const bizDate = getBizDateTodayTPE();
 
-  // ✅ 一定印：呼叫前
   console.log(`[STOCK RPC] ver=V2026-01-12_DEBUG_WHLIST group=${group} bizDate=${bizDate} sku=${s} stage=before`);
 
   const { data, error } = await supabase.rpc('get_business_day_stock', {
@@ -281,21 +285,28 @@ async function getWarehouseStockBySku(branch, sku) {
   }
 
   const rows = Array.isArray(data) ? data : [];
-  const kept = rows
-    .map((r) => ({
-      warehouse: String(r.warehouse_name || r.warehouse_code || 'unspecified'),
-      warehouse_code: String(r.warehouse_code || ''),
-      box: Number(r.box || 0),
-      piece: Number(r.piece || 0),
-      unitsPerBox: Number(r.units_per_box || 1),
-      unitPricePiece: Number(r.unit_price_piece || 0),
-    }))
-    .filter((w) => w.box > 0 || w.piece > 0);
 
-  // ✅ 一定印：回來後（把每筆倉庫列出來）
+  // ✅ 這裡是你之前 undefined 的根因：欄位名要統一成 warehouseCode/warehouseLabel
+  const kept = await Promise.all(
+    rows
+      .map(async (r) => {
+        const warehouseCode = String(r.warehouse_code || 'unspecified').trim() || 'unspecified';
+        const warehouseLabel = await resolveWarehouseLabel(warehouseCode); // 一律用 code -> 中文
+        return {
+          warehouseCode,
+          warehouseLabel,
+          box: Number(r.box || 0),
+          piece: Number(r.piece || 0),
+          unitsPerBox: Number(r.units_per_box || 1),
+          unitPricePiece: Number(r.unit_price_piece || 0),
+        };
+      })
+      .filter((w) => (w.box > 0 || w.piece > 0)),
+  );
+
   console.log(
     `[STOCK RPC] ver=V2026-01-12_DEBUG_WHLIST group=${group} bizDate=${bizDate} sku=${s} stage=after rows=${rows.length} kept=${kept.length} wh=${kept
-      .map((x) => `${x.warehouse_code || x.warehouse}:${x.box}/${x.piece}`)
+      .map((x) => `${x.warehouseCode}:${x.box}/${x.piece}`)
       .join(',')}`,
   );
 
@@ -317,7 +328,19 @@ async function getWarehouseSnapshot(branch, sku, warehouseCodeOrLabel) {
   if (error) throw error;
 
   const row = Array.isArray(data) ? data[0] : data;
-  if (!row) return { warehouseCode: whCode, warehouseLabel: await resolveWarehouseLabel(whCode), box: 0, piece: 0, unitsPerBox: 1, unitPricePiece: 0, stockAmount: 0 };
+  const warehouseLabel = await resolveWarehouseLabel(whCode);
+
+  if (!row) {
+    return {
+      warehouseCode: whCode,
+      warehouseLabel,
+      box: 0,
+      piece: 0,
+      unitsPerBox: 1,
+      unitPricePiece: 0,
+      stockAmount: 0,
+    };
+  }
 
   const box = Number(row.box || 0);
   const piece = Number(row.piece || 0);
@@ -327,7 +350,7 @@ async function getWarehouseSnapshot(branch, sku, warehouseCodeOrLabel) {
 
   return {
     warehouseCode: whCode,
-    warehouseLabel: await resolveWarehouseLabel(whCode),
+    warehouseLabel,
     box,
     piece,
     unitsPerBox,
@@ -434,7 +457,7 @@ function buildQuickReplyForProducts(products) {
   return { items };
 }
 
-// 查詢用：一定帶 warehouseCode（文字送 code，顯示送中文）
+// 查詢用：顯示中文、送出 code
 function buildQuickReplyForWarehousesForQuery(warehouseList) {
   const items = warehouseList.slice(0, 12).map((w) => ({
     type: 'action',
@@ -503,7 +526,7 @@ async function callOutOnceTx({ branch, sku, outBox, outPiece, warehouseCode, lin
   const authUuid = await resolveAuthUuidFromLineUserId(lineUserId);
   if (!authUuid) throw new Error(`找不到對應的使用者，請先在後台綁定帳號。`);
 
-  // ⚠️ 這裡「一律傳 warehouseCode」，避免 name/code 混用造成扣錯倉
+  // ⚠️ 一律傳 warehouseCode（避免 name/code 混用造成扣錯倉）
   const args = {
     p_group: String(branch || '').trim().toLowerCase(),
     p_sku: skuKey(sku),
@@ -525,7 +548,6 @@ async function callOutOnceTx({ branch, sku, outBox, outPiece, warehouseCode, lin
     unitPricePiece: Number(row?.unit_price_piece || 0),
     outBox: Number(row?.out_box || 0),
     outPiece: Number(row?.out_piece || 0),
-    // 這兩個如果你的 RPC 有回，會用；沒有回就等下再 requery
     afterBox: row?.after_box == null ? null : Number(row.after_box || 0),
     afterPiece: row?.after_piece == null ? null : Number(row.after_piece || 0),
     warehouseCode: String(warehouseCode || 'unspecified'),
@@ -639,6 +661,7 @@ async function upsertUserLastProduct(lineUserId, branch, sku) {
     .eq('user_id', lineUserId)
     .eq('群組', branch)
     .maybeSingle();
+
   if (data) {
     await supabase
       .from('user_last_product')
@@ -711,6 +734,7 @@ async function handleEvent(event) {
 
   const { branch, role, blocked, needBindMsg } = await resolveBranchAndRole(event);
   if (blocked) return;
+
   if (!branch) {
     await client.replyMessage(event.replyToken, {
       type: 'text',
@@ -766,7 +790,7 @@ async function handleEvent(event) {
     }
     await upsertUserLastProduct(lineUserId, branch, sku);
 
-    // ✅ 多倉：一定跳 Quick Reply（用 code 當選項）
+    // ✅ 多倉：一定跳 Quick Reply（顯示中文、送 code）
     if (whList.length >= 2) {
       await reply({
         type: 'text',
@@ -938,7 +962,7 @@ async function handleEvent(event) {
         return;
       }
 
-      // 4) ✅ 一律 requery 出庫後庫存（解決你說的「回覆未扣」）
+      // 4) ✅ 一律 requery 出庫後庫存（解決「回覆未扣」）
       const snapAfter = await getWarehouseSnapshot(branch, skuLast, chosenWhCode);
 
       if (snapAfter.box < 0 || snapAfter.piece < 0) {
@@ -963,7 +987,7 @@ async function handleEvent(event) {
         return;
       }
 
-      // 5) 推送 GAS（照你原本邏輯）
+      // 5) 推送 GAS
       try {
         const outAmountForGas =
           (Number(result.outBox || outBox) * snapAfter.unitsPerBox + Number(result.outPiece || outPiece)) *
@@ -1007,5 +1031,3 @@ async function handleEvent(event) {
 app.listen(PORT, () => {
   console.log(`伺服器運行在${PORT}端口 ver=V2026-01-12_DEBUG_WHLIST`);
 });
-
-
