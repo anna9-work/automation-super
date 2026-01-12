@@ -993,5 +993,7 @@ async function handleEvent(event) {
 
 /* ======== Start server ======== */
 app.listen(PORT, () => {
-  console.log(`伺服器運行在${PORT}端口`);
+  console.log(`伺服器運行在${PORT}端口 ver=V2026-01-12_DEBUG_WHLIST`);
 });
+
+
