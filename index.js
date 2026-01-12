@@ -197,24 +197,6 @@ async function getWarehouseCodeForLabel(displayNameOrCode) {
   return 'unspecified';
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 /* ======== Branch & User ======== */
 async function resolveAuthUuidFromLineUserId(lineUserId) {
   if (!lineUserId) return null;
@@ -278,7 +260,6 @@ async function getWarehouseStockBySku(branch, sku) {
   if (!group || !s) return [];
 
   const bizDate = getBizDateTodayTPE();
-
 
   console.log(`[STOCK RPC] ver=V2026-01-12_ALLFIX group=${group} bizDate=${bizDate} sku=${s} stage=before`);
 
@@ -471,18 +452,12 @@ function buildQuickReplyForProducts(items) {
 }
 
 function buildQuickReplyForWarehousesForQuery(warehouseList) {
-
-
-
-
-
   const items = warehouseList.slice(0, 12).map((w) => ({
     type: 'action',
     action: {
       type: 'message',
       label: `${w.warehouseLabel}（${w.box}箱/${w.piece}件）`.slice(0, 20),
       text: `倉 ${w.warehouseLabel}`, // ✅ 使用端看到中文（你要求）
-
     },
   }));
   return { items };
@@ -495,15 +470,6 @@ function buildQuickReplyForWarehouses(baseText, warehouseList, wantBox, wantPiec
       .trim(); // ✅ 使用端中文
     return { type: 'action', action: { type: 'message', label, text } };
   });
-
-
-
-
-
-
-
-
-
   return { items };
 }
 
@@ -564,19 +530,9 @@ function parsePostback(data) {
   // 形式：a=wh_select&sku=a564&wh=withdraw
   const params = new URLSearchParams(s);
   const a = params.get('a');
-
   if (a === 'wh_select') {
     return { type: 'wh_select_postback', sku: skuKey(params.get('sku')), wh: params.get('wh') };
   }
-
-
-
-
-
-
-
-
-
   return null;
 }
 
@@ -783,7 +739,6 @@ async function handleEvent(event) {
     const pb = parsePostback(event?.postback?.data);
     if (!pb) return;
 
-
     if (pb.type === 'wh_select_postback') {
       const sku = pb.sku || getLastSku(lineUserId, branch);
       if (!sku) {
@@ -794,7 +749,6 @@ async function handleEvent(event) {
       const whCode = await getWarehouseCodeForLabel(pb.wh); // pb.wh 可能是 code
       LAST_WAREHOUSE_CODE_BY_USER_BRANCH.set(`${lineUserId}::${branch}`, whCode);
 
-
       const snap = await getWarehouseSnapshot(branch, sku, whCode);
 
       await replyText(
@@ -804,90 +758,6 @@ async function handleEvent(event) {
       );
       return;
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     return;
   }
@@ -1130,5 +1000,5 @@ async function handleEvent(event) {
 
 /* ======== Start server ======== */
 app.listen(PORT, () => {
-  // ✅ 你想縮短可以，但這行只跑一次，不影響效能
   console.log(`server up :${PORT} ver=V2026-01-12_FAST_ACK`);
+});
