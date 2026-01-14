@@ -5,16 +5,16 @@ import { createClient } from '@supabase/supabase-js';
 
 /**
  * =========================================================
- *  LINE Bot for Inventory（高頻穩定版：方案1 / PushMessage）
- *  - webhook 立刻回 200
- *  - 後續一律用 pushMessage 回覆（不再依賴 replyToken）
- *  - 事件去重（避免 webhook 重送造成重複扣庫）
- *  - 同來源串行鎖（同 groupId/userId 同時只跑一件，避免併發炸 DB）
- *  - 熱點快取（當日庫存清單 60s；分店/角色 30s；倉庫字典 1h）
+ *  LINE Bot for Inventory（高頻穩定版：PushMessage）
+ *  ✅ webhook 立刻回 200
+ *  ✅ 一律 pushMessage 回覆（不依賴 replyToken）
+ *  ✅ 事件去重（避免重送）
+ *  ✅ 串行鎖改為「同群組同使用者」：不同使用者可並行（避免群組排隊卡死）
+ *  ✅ Supabase 全域 fetch timeout（避免 RPC 卡住拖死）
  *
  *  功能：
  *  - 查詢：只在「當日有庫存（約 200 筆）」內做關鍵字比對
- *  - 快照：public.get_business_day_stock（與試算表一致）
+ *  - 快照：public.get_business_day_stock
  *  - 出庫：fifo_out_and_log（單一交易）
  *  - 支援 message + postback
  *  - db 指令：回覆 bot 版本、db host、biz_date(05:00切日)
@@ -36,10 +36,11 @@ const {
 if (!LINE_CHANNEL_ACCESS_TOKEN || !LINE_CHANNEL_SECRET) console.error('缺少 LINE 環境變數');
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) console.error('缺少 Supabase 環境變數 (URL / SERVICE_ROLE_KEY)');
 
-const BOT_VER = 'V2026-01-14_PUSH_ONLY_DEDUP_LOCK_CACHE';
+const BOT_VER = 'V2026-01-14_PUSH_PER_USER_LOCK_TIMEOUT';
 
-/* ======== App / Supabase ======== */
+/* ======== App / LINE / Supabase ======== */
 const app = express(); // ⚠️ webhook 前不可掛 body parser
+
 app.use((req, _res, next) => {
   console.log(
     `[請求] ${req.method} ${req.path} ua=${req.headers['user-agent'] || ''} x-line-signature=${
@@ -50,9 +51,6 @@ app.use((req, _res, next) => {
 });
 
 const client = new line.Client({ channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN });
-const supabase = createClient(SUPABASE_URL.replace(/\/+$/, ''), SUPABASE_SERVICE_ROLE_KEY, {
-  auth: { persistSession: false },
-});
 
 function getSupabaseHost() {
   try {
@@ -64,6 +62,20 @@ function getSupabaseHost() {
 }
 const SUPA_HOST = getSupabaseHost();
 
+/** ✅ Supabase 全域 timeout fetch（避免 RPC 卡住） */
+const SUPA_TIMEOUT_MS = 8000;
+function fetchWithTimeout(url, options = {}) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), SUPA_TIMEOUT_MS);
+  return fetch(url, { ...options, signal: controller.signal })
+    .finally(() => clearTimeout(id));
+}
+
+const supabase = createClient(SUPABASE_URL.replace(/\/+$/, ''), SUPABASE_SERVICE_ROLE_KEY, {
+  auth: { persistSession: false },
+  global: { fetch: fetchWithTimeout },
+});
+
 /* ======== Runtime caches ======== */
 const LAST_WAREHOUSE_CODE_BY_USER_BRANCH = new Map(); // key=`${userId}::${branch}` -> warehouse_code
 const LAST_SKU_BY_USER_BRANCH = new Map(); // key=`${userId}::${branch}` -> sku(lower)
@@ -72,19 +84,16 @@ const WH_LABEL_CACHE = new Map(); // key -> { ts, val }
 const WH_CODE_CACHE = new Map(); // key -> { ts, val }
 const WH_CACHE_TTL_MS = 60 * 60 * 1000; // 1h
 
-/* ✅ 查詢快取：當天有庫存清單（200筆） */
 const STOCK_LIST_CACHE = new Map(); // key=`${branch}::${bizDate}` -> { ts, rows }
 const STOCK_LIST_TTL_MS = 60 * 1000; // 60s
 
-/* ✅ 分店/角色快取 */
 const BRANCH_ROLE_CACHE = new Map(); // key=`${src.type}::${groupId||userId}` -> { ts, val }
 const BRANCH_ROLE_TTL_MS = 30 * 1000; // 30s
 
-/* ✅ 事件去重（避免重送） */
 const EVENT_DEDUP = new Map(); // key -> ts
 const EVENT_DEDUP_TTL_MS = 3 * 60 * 1000; // 3m
 
-/* ✅ 串行鎖（同來源不要同時跑多個） */
+/** ✅ 串行鎖：改成「同群組同使用者」 */
 const LOCKS = new Map(); // key -> Promise chain
 
 /* ======== Fixed warehouse labels (code -> 中文) ======== */
@@ -147,6 +156,7 @@ function cacheGet(map, key, ttlMs) {
 function cacheSet(map, key, val) {
   map.set(key, { ts: nowMs(), val });
 }
+
 function pruneDedup() {
   const t = nowMs();
   for (const [k, ts] of EVENT_DEDUP.entries()) {
@@ -222,7 +232,7 @@ async function pushTextWithQuickReply(event, text, quickReply) {
   }
 }
 
-/* ======== Warehouse resolvers（對齊 warehouse_kinds） ======== */
+/* ======== Warehouse resolvers ======== */
 async function resolveWarehouseLabel(codeOrName) {
   const key = String(codeOrName || '').trim();
   if (!key) return '未指定';
@@ -260,7 +270,6 @@ async function getWarehouseCodeForLabel(displayNameOrCode) {
   const label = String(displayNameOrCode || '').trim();
   if (!label) return 'unspecified';
 
-  // code 直接回
   if (/^[a-z0-9_]+$/i.test(label)) {
     if (FIX_CODE_TO_NAME.has(label)) return label;
 
@@ -283,11 +292,9 @@ async function getWarehouseCodeForLabel(displayNameOrCode) {
     return label.toLowerCase();
   }
 
-  // 中文→code cache
   const cachedZh = cacheGet(WH_CODE_CACHE, label, WH_CACHE_TTL_MS);
   if (cachedZh) return cachedZh;
 
-  // 固定表 reverse
   for (const [code, name] of FIX_CODE_TO_NAME.entries()) {
     if (name === label) {
       cacheSet(WH_CODE_CACHE, name, code);
@@ -295,7 +302,6 @@ async function getWarehouseCodeForLabel(displayNameOrCode) {
     }
   }
 
-  // DB 查詢
   try {
     const { data } = await supabase
       .from('warehouse_kinds')
@@ -321,10 +327,7 @@ async function resolveAuthUuidFromLineUserId(lineUserId) {
     .select('auth_user_id')
     .eq('line_user_id', lineUserId)
     .maybeSingle();
-  if (error) {
-    console.warn('[resolveAuthUuid] line_user_map error:', error);
-    return null;
-  }
+  if (error) return null;
   return data?.auth_user_id || null;
 }
 
@@ -378,14 +381,13 @@ async function autoRegisterUser(lineUserId) {
     await supabase.from('users').insert({ user_id: lineUserId, 群組: DEFAULT_GROUP, 角色: 'user', 黑名單: false });
 }
 
-/* ======== 業務日結存：單一 SKU（快照） ======== */
+/* ======== Stock RPCs ======== */
 async function getWarehouseStockBySku(branch, sku) {
   const group = String(branch || '').trim().toLowerCase();
   const s = skuKey(sku);
   if (!group || !s) return [];
 
   const bizDate = getBizDate0500TPE();
-
   console.log(`[DB] host=${SUPA_HOST} ver=${BOT_VER}`);
   console.log(`[STOCK RPC] group=${group} bizDate=${bizDate} sku=${s} stage=before`);
 
@@ -397,7 +399,7 @@ async function getWarehouseStockBySku(branch, sku) {
   });
 
   if (error) {
-    console.log(`[STOCK RPC] group=${group} bizDate=${bizDate} sku=${s} stage=error msg=${error.message}`);
+    console.log(`[STOCK RPC] stage=error msg=${error.message}`);
     throw error;
   }
 
@@ -421,7 +423,7 @@ async function getWarehouseStockBySku(branch, sku) {
   );
 
   console.log(
-    `[STOCK RPC] group=${group} bizDate=${bizDate} sku=${s} stage=after rows=${rows.length} kept=${kept.length} wh=${kept
+    `[STOCK RPC] stage=after rows=${rows.length} kept=${kept.length} wh=${kept
       .map((x) => `${x.warehouseCode}:${x.box}/${x.piece}`)
       .join(',')}`,
   );
@@ -445,7 +447,6 @@ async function getWarehouseSnapshot(branch, sku, warehouseCodeOrLabel) {
   if (error) throw error;
 
   const row = Array.isArray(data) ? data[0] : data;
-
   if (!row) {
     return {
       warehouseCode: whCode,
@@ -475,7 +476,7 @@ async function getWarehouseSnapshot(branch, sku, warehouseCodeOrLabel) {
   };
 }
 
-/* ======== ✅ 當日有庫存清單（一次 RPC + 快取） ======== */
+/* ======== Today Stock list cache ======== */
 async function getTodayStockRows(branch) {
   const group = String(branch || '').trim().toLowerCase();
   if (!group) return [];
@@ -499,7 +500,6 @@ async function getTodayStockRows(branch) {
   return kept;
 }
 
-/* ======== ✅ 關鍵字查詢：只在當日庫存內比對 ======== */
 async function searchByNameInStock(keyword, branch) {
   const k = String(keyword || '').trim();
   if (!k) return [];
@@ -507,7 +507,6 @@ async function searchByNameInStock(keyword, branch) {
 
   const seen = new Set();
   const out = [];
-
   for (const r of rows) {
     const sku = skuKey(r.product_sku || r['貨品編號']);
     if (!sku || seen.has(sku)) continue;
@@ -571,7 +570,6 @@ function buildQuickReplyForProducts(items) {
   }));
   return { items: actions };
 }
-
 function buildQuickReplyForWarehousesForQuery(warehouseList) {
   const items = warehouseList.slice(0, 12).map((w) => ({
     type: 'action',
@@ -583,7 +581,6 @@ function buildQuickReplyForWarehousesForQuery(warehouseList) {
   }));
   return { items };
 }
-
 function buildQuickReplyForWarehouses(baseText, warehouseList, wantBox, wantPiece) {
   const items = warehouseList.slice(0, 12).map((w) => {
     const label = `${w.warehouseLabel}（${w.box}箱/${w.piece}散）`.slice(0, 20);
@@ -600,14 +597,10 @@ function parseCommand(text) {
   if (!t) return null;
 
   if (/^(db|DB|版本)$/.test(t)) return { type: 'db' };
-
   if (!/^(查|查詢|條碼|編號|#|入庫|入|出庫|出|倉)/.test(t)) return null;
 
   const mWhSel = t.match(/^倉(?:庫)?\s*(.+)$/);
   if (mWhSel) return { type: 'wh_select', warehouse: mWhSel[1].trim() };
-
-  const mBarcode = t.match(/^條碼[:：]?\s*(.+)$/);
-  if (mBarcode) return { type: 'barcode', barcode: mBarcode[1].trim() };
 
   const mSkuHash = t.match(/^#\s*(.+)$/);
   if (mSkuHash) return { type: 'sku', sku: mSkuHash[1].trim() };
@@ -647,7 +640,6 @@ function parseCommand(text) {
   return null;
 }
 
-/* ======== Postback parser ======== */
 function parsePostback(data) {
   const s = String(data || '').trim();
   if (!s) return null;
@@ -690,7 +682,7 @@ async function callOutOnceTx({ branch, sku, outBox, outPiece, warehouseCode, lin
   };
 }
 
-/* ======== GAS Webhook (optional, fire-and-forget) ======== */
+/* ======== GAS (optional) ======== */
 let GAS_URL_CACHE = (ENV_GAS_URL || '').trim();
 let GAS_SECRET_CACHE = (ENV_GAS_SECRET || '').trim();
 let GAS_LOADED_ONCE = false;
@@ -716,29 +708,23 @@ async function loadGasConfigFromDBIfNeeded(force = false) {
     }
     GAS_LOADED_ONCE = true;
     GAS_LAST_LOAD_MS = now;
-    console.log('[GAS CONFIG] url =', GAS_URL_CACHE ? GAS_URL_CACHE.slice(0, 80) : '(empty)');
   } catch (e) {
     GAS_LOADED_ONCE = true;
     GAS_LAST_LOAD_MS = now;
-    console.warn('⚠️ 載入 GAS 設定失敗（RPC get_app_settings）：', e?.message || e);
+    console.warn('⚠️ 載入 GAS 設定失敗：', e?.message || e);
   }
 }
-
 async function getGasConfig() {
   if (!GAS_LOADED_ONCE || !GAS_URL_CACHE || !GAS_SECRET_CACHE) await loadGasConfigFromDBIfNeeded(true);
   return { url: GAS_URL_CACHE, secret: GAS_SECRET_CACHE };
 }
-
 async function postInventoryToGAS(payload) {
   const { url, secret } = await getGasConfig();
-  if (!url || !secret) {
-    console.warn('⚠️ GAS 未設定（略過推送）');
-    return;
-  }
+  if (!url || !secret) return;
+
   const cleanBaseUrl = url.replace(/\?.*$/, '');
   const callUrl = `${cleanBaseUrl}?secret=${encodeURIComponent(secret)}`;
   try {
-    console.log('[GAS CALL]', cleanBaseUrl);
     const res = await fetch(callUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -753,7 +739,7 @@ async function postInventoryToGAS(payload) {
   }
 }
 
-/* ======== Last product helpers ======== */
+/* ======== Last SKU helpers ======== */
 function setLastSku(lineUserId, branch, sku) {
   if (!lineUserId) return;
   LAST_SKU_BY_USER_BRANCH.set(`${lineUserId}::${branch}`, skuKey(sku));
@@ -764,24 +750,18 @@ function getLastSku(lineUserId, branch) {
   return mem ? skuKey(mem) : null;
 }
 
-/* ======== Utilities ======== */
+/* ======== Log & dedup & lock key ======== */
 function logEventSummary(event) {
   try {
     const src = event?.source || {};
     const msg = event?.message || {};
     const isGroup = src.type === 'group';
-    const isRoom = src.type === 'room';
     console.log(
       `[LINE EVENT] type=${event?.type} msgType=${msg?.type || '-'} source=${src.type || '-'} groupId=${
         isGroup ? src.groupId : '-'
-      } roomId=${isRoom ? src.roomId : '-'} userId=${src.userId || '-'} text="${msg?.type === 'text' ? msg.text : ''}"`,
+      } userId=${src.userId || '-'} text="${msg?.type === 'text' ? msg.text : ''}"`,
     );
-    if (event?.type === 'postback') {
-      console.log(`[LINE POSTBACK] data=${event?.postback?.data || ''}`);
-    }
-  } catch (e) {
-    console.error('[LINE EVENT LOG ERROR]', e);
-  }
+  } catch {}
 }
 
 function buildEventDedupKey(ev) {
@@ -798,10 +778,14 @@ function buildEventDedupKey(ev) {
   }
 }
 
+/** ✅ 關鍵：鎖改成「groupId::userId」 */
 function buildLockKey(ev) {
   const src = ev?.source || {};
-  if (src.type === 'group' && src.groupId) return `g:${src.groupId}`;
-  if (src.userId) return `u:${src.userId}`;
+  const gid = src.type === 'group' ? src.groupId : '';
+  const uid = src.userId || '';
+  if (gid && uid) return `g:${gid}::u:${uid}`;
+  if (uid) return `u:${uid}`;
+  if (gid) return `g:${gid}`;
   return 'unknown';
 }
 
@@ -810,18 +794,17 @@ const lineConfig = { channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN, channelSecre
 app.get('/health', (_req, res) => res.status(200).send('OK'));
 app.get('/', (_req, res) => res.status(200).send('RUNNING'));
 app.get('/webhook', (_req, res) => res.status(200).send('OK'));
-app.get('/line/webhook', (_req, res) => res.status(200).send('OK'));
 app.post('/webhook', line.middleware(lineConfig), lineHandler);
-app.post('/line/webhook', line.middleware(lineConfig), lineHandler);
+
 app.use((err, req, res, next) => {
-  if (req.path === '/webhook' || req.path === '/line/webhook') {
+  if (req.path === '/webhook') {
     console.error('[LINE MIDDLEWARE ERROR]', err?.message || err);
     return res.status(400).end();
   }
   return next(err);
 });
 
-/* ======== ✅ Main Handler：先回 200 再處理（Push 模式沒問題） ======== */
+/* ======== Main Handler ======== */
 async function lineHandler(req, res) {
   try {
     const events = req.body?.events || [];
@@ -843,7 +826,10 @@ async function lineHandler(req, res) {
             await handleEvent(ev);
           });
         } catch (err) {
-          console.error('[HANDLE EVENT ERROR]', err);
+          console.error('[HANDLE EVENT ERROR]', err?.message || err);
+          // Supabase timeout 常見是 AbortError
+          const m = String(err?.name || '').includes('Abort') ? '系統忙碌（查詢逾時），請再試一次' : `系統忙碌或發生錯誤：${err?.message || '未知錯誤'}`;
+          await pushText(ev, m);
         }
       }
     });
@@ -896,14 +882,12 @@ async function handleEvent(event) {
   const parsed = parseCommand(text);
   if (!parsed) return;
 
-  // db
   if (parsed.type === 'db') {
     const bizDate = getBizDate0500TPE();
-    await pushText(event, `BOT=${BOT_VER}\nDB_HOST=${SUPA_HOST}\nBIZ_DATE_0500=${bizDate}`);
+    await pushText(event, `BOT=${BOT_VER}\nDB_HOST=${SUPA_HOST}\nBIZ_DATE_0500=${bizDate}\nSUPA_TIMEOUT_MS=${SUPA_TIMEOUT_MS}`);
     return;
   }
 
-  // 倉庫選擇（文字）
   if (parsed.type === 'wh_select') {
     const sku = getLastSku(lineUserId, branch);
     if (!sku) return pushText(event, '請先選商品（查/編號）再選倉庫');
@@ -916,7 +900,6 @@ async function handleEvent(event) {
     return;
   }
 
-  // 查詢共用
   const doQueryCommon = async (p) => {
     const sku = skuKey(p.sku);
     const whList = await getWarehouseStockBySku(branch, sku);
@@ -938,7 +921,6 @@ async function handleEvent(event) {
     );
   };
 
-  // 查 關鍵字
   if (parsed.type === 'query') {
     const list = await searchByNameInStock(parsed.keyword, branch);
     if (!list.length) return pushText(event, '無此商品庫存');
@@ -951,7 +933,6 @@ async function handleEvent(event) {
     return;
   }
 
-  // 編號 / #
   if (parsed.type === 'sku') {
     const list = await searchBySkuInStock(parsed.sku, branch);
     if (!list.length) return pushText(event, '無此商品庫存');
@@ -964,7 +945,6 @@ async function handleEvent(event) {
     return;
   }
 
-  // 入/出庫
   if (parsed.type === 'change') {
     if (parsed.action === 'in') {
       if (role !== '主管') return pushText(event, '您無法使用「入庫」');
@@ -1003,43 +983,32 @@ async function handleEvent(event) {
 
     LAST_WAREHOUSE_CODE_BY_USER_BRANCH.set(lastWhKey, chosenWhCode);
 
-    // 出庫前 requery
     const snapBefore = await getWarehouseSnapshot(branch, skuLast, chosenWhCode);
-    const curBox = snapBefore.box || 0;
-    const curPiece = snapBefore.piece || 0;
-
-    if (outBox > 0 && curBox < outBox) {
-      return pushText(event, `庫存不足，無法出庫（倉別：${snapBefore.warehouseLabel}）\n目前庫存：${curBox}箱${curPiece}散`);
+    if (outBox > 0 && snapBefore.box < outBox) {
+      return pushText(event, `庫存不足，無法出庫（倉別：${snapBefore.warehouseLabel}）\n目前庫存：${snapBefore.box}箱${snapBefore.piece}散`);
     }
-    if (outPiece > 0 && curPiece < outPiece) {
-      return pushText(event, `庫存不足，無法出庫（倉別：${snapBefore.warehouseLabel}）\n目前庫存：${curBox}箱${curPiece}散`);
+    if (outPiece > 0 && snapBefore.piece < outPiece) {
+      return pushText(event, `庫存不足，無法出庫（倉別：${snapBefore.warehouseLabel}）\n目前庫存：${snapBefore.box}箱${snapBefore.piece}散`);
     }
 
     let result;
-    try {
-      result = await callOutOnceTx({
-        branch,
-        sku: skuLast,
-        outBox,
-        outPiece,
-        warehouseCode: chosenWhCode,
-        lineUserId,
-      });
-    } catch (err) {
-      console.error('[fifo_out_and_log ERROR]', err);
-      return pushText(event, `操作失敗：${err?.message || '未知錯誤'}`);
-    }
+    result = await callOutOnceTx({
+      branch,
+      sku: skuLast,
+      outBox,
+      outPiece,
+      warehouseCode: chosenWhCode,
+      lineUserId,
+    });
 
-    // 出庫後再查一次
     const snapAfter = await getWarehouseSnapshot(branch, skuLast, chosenWhCode);
-    const whLabel = snapAfter.warehouseLabel;
 
     await pushText(
       event,
-      `✅ 出庫成功\n編號：${skuDisplay(skuLast)}\n倉別：${whLabel}\n出庫：${Number(result.outBox || outBox)}箱 ${Number(result.outPiece || outPiece)}件\n👉目前庫存：${snapAfter.box}箱${snapAfter.piece}散`,
+      `✅ 出庫成功\n編號：${skuDisplay(skuLast)}\n倉別：${snapAfter.warehouseLabel}\n出庫：${Number(result.outBox || outBox)}箱 ${Number(result.outPiece || outPiece)}件\n👉目前庫存：${snapAfter.box}箱${snapAfter.piece}散`,
     );
 
-    // 推送 GAS（不阻塞）
+    // GAS fire-and-forget
     try {
       const outAmountForGas =
         (Number(result.outBox || outBox) * snapAfter.unitsPerBox + Number(result.outPiece || outPiece)) *
@@ -1060,7 +1029,7 @@ async function handleEvent(event) {
         stock_piece: Number(snapAfter.piece || 0),
         out_amount: outAmountForGas,
         stock_amount: Number(snapAfter.stockAmount || 0),
-        warehouse: whLabel,
+        warehouse: snapAfter.warehouseLabel,
         warehouse_code: chosenWhCode,
         created_at: tpeNowISO(),
         bot_ver: BOT_VER,
@@ -1068,12 +1037,10 @@ async function handleEvent(event) {
         biz_date_0500: getBizDate0500TPE(),
       };
 
-      postInventoryToGAS(payload).catch((e) => console.warn('[GAS FIRE-AND-FORGET ERROR]', e));
+      postInventoryToGAS(payload).catch((e) => console.warn('[GAS ERROR]', e?.message || e));
     } catch (e) {
-      console.warn('[GAS PAYLOAD ERROR]', e);
+      console.warn('[GAS PAYLOAD ERROR]', e?.message || e);
     }
-
-    return;
   }
 }
 
