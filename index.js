@@ -16,6 +16,7 @@ import { createClient } from '@supabase/supabase-js';
  *  A) 事件去重（message.id / postback.data + replyToken）
  *  B) 同來源串行鎖（同 groupId/userId 同時間只跑一件）
  *  C) 熱點查詢快取（庫存清單 60s；分店/角色 30s；倉庫字典 1h）
+ *  D) ✅ 加入 LINE Reply 成功/失敗/耗時 log（抓出為何體感卡住）
  * =========================================================
  */
 
@@ -34,7 +35,7 @@ const {
 if (!LINE_CHANNEL_ACCESS_TOKEN || !LINE_CHANNEL_SECRET) console.error('缺少 LINE 環境變數');
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) console.error('缺少 Supabase 環境變數 (URL / SERVICE_ROLE_KEY)');
 
-const BOT_VER = 'V2026-01-13_FAST_ACK_DEDUP_LOCK_CACHE';
+const BOT_VER = 'V2026-01-13_FAST_ACK_DEDUP_LOCK_CACHE_REPLYLOG';
 
 /* ======== App / Supabase ======== */
 const app = express(); // ⚠️ webhook 前不可掛 body parser
@@ -171,7 +172,6 @@ async function withLock(key, fn) {
     return await fn();
   } finally {
     resolveNext();
-    // 清理：如果 next 已是尾端，稍後把 lock 移除
     setTimeout(() => {
       if (LOCKS.get(key) === next) LOCKS.delete(key);
     }, 1000).unref?.();
@@ -744,13 +744,9 @@ function buildEventDedupKey(ev) {
   try {
     const src = ev?.source || {};
     const msg = ev?.message || {};
-    // 1) message.id 最佳
     if (ev?.type === 'message' && msg?.id) return `m:${msg.id}`;
-    // 2) postback data + replyToken
     if (ev?.type === 'postback') return `p:${ev?.postback?.data || ''}:${ev?.replyToken || ''}`;
-    // 3) fallback：replyToken（有效期短，但足夠去重）
     if (ev?.replyToken) return `r:${ev.replyToken}`;
-    // 4) 最後：source + timestamp + text（仍可擋住大部分重送）
     const who = src.type === 'group' ? src.groupId : src.userId;
     const text = msg?.type === 'text' ? msg.text : '';
     return `f:${src.type}:${who}:${String(text).slice(0, 50)}`;
@@ -789,7 +785,6 @@ async function lineHandler(req, res) {
     res.status(200).send('OK'); // ✅ 立刻回 200
 
     setImmediate(async () => {
-      // ✅ 這裡改成「有鎖、有去重」的處理
       for (const ev of events) {
         logEventSummary(ev);
 
@@ -806,17 +801,7 @@ async function lineHandler(req, res) {
           });
         } catch (err) {
           console.error('[HANDLE EVENT ERROR]', err);
-          const token = ev.replyToken;
-          if (token) {
-            try {
-              await client.replyMessage(token, {
-                type: 'text',
-                text: `系統忙碌或發生錯誤：${err?.message || '未知錯誤'}`,
-              });
-            } catch (e2) {
-              console.error('[HANDLE EVENT REPLY ERROR]', e2);
-            }
-          }
+          // ⚠️ 這裡不要強行回覆（replyToken 可能已失效/已用過），只記 log
         }
       }
     });
@@ -840,12 +825,38 @@ async function handleEvent(event) {
   if (blocked) return;
   if (!branch) {
     if (event.replyToken) {
-      await client.replyMessage(event.replyToken, { type: 'text', text: needBindMsg || '尚未綁定分店' });
+      // ✅ reply log
+      const t0 = Date.now();
+      try {
+        await client.replyMessage(event.replyToken, { type: 'text', text: needBindMsg || '尚未綁定分店' });
+        console.log(`[LINE REPLY] ok ms=${Date.now() - t0} type=text (needBind)`);
+      } catch (e) {
+        console.error(
+          `[LINE REPLY] fail ms=${Date.now() - t0} msg=${e?.message || e} code=${e?.statusCode || '-'} details=${JSON.stringify(
+            e?.originalError?.response?.data || e?.response?.data || {},
+          )}`,
+        );
+      }
     }
     return;
   }
 
-  const reply = (msg) => client.replyMessage(event.replyToken, msg);
+  // ✅ 統一 reply 包裝：成功/失敗/耗時 log
+  const reply = async (msg) => {
+    const t0 = Date.now();
+    try {
+      const r = await client.replyMessage(event.replyToken, msg);
+      console.log(`[LINE REPLY] ok ms=${Date.now() - t0} type=${msg?.type || '-'}`);
+      return r;
+    } catch (e) {
+      console.error(
+        `[LINE REPLY] fail ms=${Date.now() - t0} msg=${e?.message || e} code=${e?.statusCode || '-'} details=${JSON.stringify(
+          e?.originalError?.response?.data || e?.response?.data || {},
+        )}`,
+      );
+      throw e;
+    }
+  };
   const replyText = (s) => reply({ type: 'text', text: s });
 
   // ✅ db 指令：直接回覆目前 bot 連線的 supabase host + biz_date
