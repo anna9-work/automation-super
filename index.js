@@ -1,4 +1,4 @@
-1/14上線版 import 'dotenv/config';
+import 'dotenv/config';
 import express from 'express';
 import line from '@line/bot-sdk';
 import { createClient } from '@supabase/supabase-js';
