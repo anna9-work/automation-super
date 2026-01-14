@@ -12,10 +12,10 @@ import { createClient } from '@supabase/supabase-js';
  *  - 支援 message + postback
  *  - webhook 立刻回 200，避免 LINE 重送造成重複事件
  *
- *  ✅ 修正：
- *  1) biz_date 改回 05:00 切日（台北時間）
- *  2) 查詢比對一律大小寫不敏感
- *  3) 加入「db」指令：回覆目前 bot 連線的 Supabase host + biz_date（用來抓出是否打錯環境）
+ *  ✅ 強化（回應更快/不易卡住）：
+ *  A) 事件去重（message.id / postback.data + replyToken）
+ *  B) 同來源串行鎖（同 groupId/userId 同時間只跑一件）
+ *  C) 熱點查詢快取（庫存清單 60s；分店/角色 30s；倉庫字典 1h）
  * =========================================================
  */
 
@@ -34,7 +34,7 @@ const {
 if (!LINE_CHANNEL_ACCESS_TOKEN || !LINE_CHANNEL_SECRET) console.error('缺少 LINE 環境變數');
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) console.error('缺少 Supabase 環境變數 (URL / SERVICE_ROLE_KEY)');
 
-const BOT_VER = 'V2026-01-13_DB_ASSERT_0500';
+const BOT_VER = 'V2026-01-13_FAST_ACK_DEDUP_LOCK_CACHE';
 
 /* ======== App / Supabase ======== */
 const app = express(); // ⚠️ webhook 前不可掛 body parser
@@ -66,11 +66,24 @@ const SUPA_HOST = getSupabaseHost();
 const LAST_WAREHOUSE_CODE_BY_USER_BRANCH = new Map(); // key=`${userId}::${branch}` -> warehouse_code
 const LAST_SKU_BY_USER_BRANCH = new Map(); // key=`${userId}::${branch}` -> sku(lower)
 
-const WH_LABEL_CACHE = new Map(); // key: kind_id 或 kind_name → kind_name（中文）
-const WH_CODE_CACHE = new Map(); // key: kind_name（中文） → kind_id（代碼）
+const WH_LABEL_CACHE = new Map(); // key -> { ts, val }
+const WH_CODE_CACHE = new Map(); // key -> { ts, val }
+const WH_CACHE_TTL_MS = 60 * 60 * 1000; // 1h
 
 /* ✅ 查詢快取：當天有庫存清單（200筆） */
 const STOCK_LIST_CACHE = new Map(); // key=`${branch}::${bizDate}` -> { ts, rows }
+const STOCK_LIST_TTL_MS = 60 * 1000; // 60s
+
+/* ✅ 分店/角色快取（避免每次都查 users/line_groups） */
+const BRANCH_ROLE_CACHE = new Map(); // key=`${src.type}::${groupId||userId}` -> { ts, val }
+const BRANCH_ROLE_TTL_MS = 30 * 1000; // 30s
+
+/* ✅ 事件去重（避免重送） */
+const EVENT_DEDUP = new Map(); // key -> ts
+const EVENT_DEDUP_TTL_MS = 3 * 60 * 1000; // 3m
+
+/* ✅ 串行鎖（同來源不要同時跑多個重活） */
+const LOCKS = new Map(); // key -> Promise chain
 
 /* ======== Fixed warehouse labels (code -> 中文) ======== */
 const FIX_CODE_TO_NAME = new Map([
@@ -116,16 +129,67 @@ function tpeNowISO() {
   return s.replace(' ', 'T') + '+08:00';
 }
 
+function nowMs() {
+  return Date.now();
+}
+
+function cacheGet(map, key, ttlMs) {
+  const it = map.get(key);
+  if (!it) return null;
+  if (nowMs() - it.ts > ttlMs) {
+    map.delete(key);
+    return null;
+  }
+  return it.val;
+}
+function cacheSet(map, key, val) {
+  map.set(key, { ts: nowMs(), val });
+}
+function pruneDedup() {
+  const t = nowMs();
+  for (const [k, ts] of EVENT_DEDUP.entries()) {
+    if (t - ts > EVENT_DEDUP_TTL_MS) EVENT_DEDUP.delete(k);
+  }
+}
+function isDupEvent(key) {
+  pruneDedup();
+  if (!key) return false;
+  if (EVENT_DEDUP.has(key)) return true;
+  EVENT_DEDUP.set(key, nowMs());
+  return false;
+}
+
+/* ✅ 串行鎖：同 key 的事件按順序跑（避免 DB/RPC 爆量） */
+async function withLock(key, fn) {
+  const prev = LOCKS.get(key) || Promise.resolve();
+  let resolveNext;
+  const next = new Promise((r) => (resolveNext = r));
+  LOCKS.set(key, prev.then(() => next).catch(() => next));
+
+  await prev; // 等前一個結束
+  try {
+    return await fn();
+  } finally {
+    resolveNext();
+    // 清理：如果 next 已是尾端，稍後把 lock 移除
+    setTimeout(() => {
+      if (LOCKS.get(key) === next) LOCKS.delete(key);
+    }, 1000).unref?.();
+  }
+}
+
 /* ======== Warehouse resolvers（對齊 warehouse_kinds） ======== */
 async function resolveWarehouseLabel(codeOrName) {
   const key = String(codeOrName || '').trim();
   if (!key) return '未指定';
-  if (WH_LABEL_CACHE.has(key)) return WH_LABEL_CACHE.get(key);
+
+  const cached = cacheGet(WH_LABEL_CACHE, key, WH_CACHE_TTL_MS);
+  if (cached) return cached;
 
   if (FIX_CODE_TO_NAME.has(key)) {
     const name = FIX_CODE_TO_NAME.get(key);
-    WH_LABEL_CACHE.set(key, name);
-    WH_CODE_CACHE.set(name, key);
+    cacheSet(WH_LABEL_CACHE, key, name);
+    cacheSet(WH_CODE_CACHE, name, key);
     return name;
   }
 
@@ -137,14 +201,14 @@ async function resolveWarehouseLabel(codeOrName) {
       .limit(1)
       .maybeSingle();
     if (data?.kind_name) {
-      WH_LABEL_CACHE.set(key, data.kind_name);
-      WH_LABEL_CACHE.set(data.kind_id, data.kind_name);
-      WH_CODE_CACHE.set(data.kind_name, data.kind_id);
+      cacheSet(WH_LABEL_CACHE, key, data.kind_name);
+      cacheSet(WH_LABEL_CACHE, data.kind_id, data.kind_name);
+      cacheSet(WH_CODE_CACHE, data.kind_name, data.kind_id);
       return data.kind_name;
     }
   } catch {}
 
-  WH_LABEL_CACHE.set(key, key);
+  cacheSet(WH_LABEL_CACHE, key, key);
   return key;
 }
 
@@ -155,6 +219,10 @@ async function getWarehouseCodeForLabel(displayNameOrCode) {
   // code 直接回（含 main / withdraw / swap / unspecified）
   if (/^[a-z0-9_]+$/i.test(label)) {
     if (FIX_CODE_TO_NAME.has(label)) return label;
+
+    const cached = cacheGet(WH_CODE_CACHE, label, WH_CACHE_TTL_MS);
+    if (cached) return cached;
+
     try {
       const { data } = await supabase
         .from('warehouse_kinds')
@@ -163,8 +231,8 @@ async function getWarehouseCodeForLabel(displayNameOrCode) {
         .limit(1)
         .maybeSingle();
       if (data?.kind_id) {
-        WH_CODE_CACHE.set(data.kind_name, data.kind_id);
-        WH_LABEL_CACHE.set(data.kind_id, data.kind_name);
+        cacheSet(WH_CODE_CACHE, data.kind_name, data.kind_id);
+        cacheSet(WH_LABEL_CACHE, data.kind_id, data.kind_name);
         return data.kind_id;
       }
     } catch {}
@@ -172,12 +240,13 @@ async function getWarehouseCodeForLabel(displayNameOrCode) {
   }
 
   // 中文→code cache
-  if (WH_CODE_CACHE.has(label)) return WH_CODE_CACHE.get(label);
+  const cachedZh = cacheGet(WH_CODE_CACHE, label, WH_CACHE_TTL_MS);
+  if (cachedZh) return cachedZh;
 
   // 固定表 reverse
   for (const [code, name] of FIX_CODE_TO_NAME.entries()) {
     if (name === label) {
-      WH_CODE_CACHE.set(name, code);
+      cacheSet(WH_CODE_CACHE, name, code);
       return code;
     }
   }
@@ -191,8 +260,8 @@ async function getWarehouseCodeForLabel(displayNameOrCode) {
       .limit(1)
       .maybeSingle();
     if (data?.kind_id) {
-      WH_CODE_CACHE.set(data.kind_name, data.kind_id);
-      WH_LABEL_CACHE.set(data.kind_id, data.kind_name);
+      cacheSet(WH_CODE_CACHE, data.kind_name, data.kind_id);
+      cacheSet(WH_LABEL_CACHE, data.kind_id, data.kind_name);
       return data.kind_id;
     }
   } catch {}
@@ -219,6 +288,11 @@ async function resolveBranchAndRole(event) {
   const src = event.source || {};
   const userId = src.userId || null;
   const isGroup = src.type === 'group';
+
+  const cacheKey = `${src.type}::${isGroup ? src.groupId : userId || ''}`;
+  const cached = cacheGet(BRANCH_ROLE_CACHE, cacheKey, BRANCH_ROLE_TTL_MS);
+  if (cached) return cached;
+
   let role = 'user',
     blocked = false;
 
@@ -232,21 +306,25 @@ async function resolveBranchAndRole(event) {
     blocked = !!u?.黑名單;
   }
 
+  let out;
   if (isGroup) {
     const { data: lg } = await supabase
       .from('line_groups')
       .select('群組')
       .eq('line_group_id', src.groupId)
       .maybeSingle();
-    return { branch: lg?.群組 || null, role, blocked, needBindMsg: '此群組尚未綁定分店，請管理員設定' };
+    out = { branch: lg?.群組 || null, role, blocked, needBindMsg: '此群組尚未綁定分店，請管理員設定' };
   } else {
     const { data: u2 } = await supabase
       .from('users')
       .select('群組')
       .eq('user_id', userId)
       .maybeSingle();
-    return { branch: u2?.群組 || null, role, blocked, needBindMsg: '此使用者尚未綁定分店，請管理員設定' };
+    out = { branch: u2?.群組 || null, role, blocked, needBindMsg: '此使用者尚未綁定分店，請管理員設定' };
   }
+
+  cacheSet(BRANCH_ROLE_CACHE, cacheKey, out);
+  return out;
 }
 
 async function autoRegisterUser(lineUserId) {
@@ -361,7 +439,7 @@ async function getTodayStockRows(branch) {
   const key = `${group}::${bizDate}`;
 
   const cached = STOCK_LIST_CACHE.get(key);
-  if (cached && Date.now() - cached.ts < 3000) return cached.rows; // 3 秒快取
+  if (cached && Date.now() - cached.ts < STOCK_LIST_TTL_MS) return cached.rows; // 60 秒快取
 
   console.log(`[DB] host=${SUPA_HOST} ver=${BOT_VER}`);
   const { data, error } = await supabase.rpc('daily_sheet_rows_full', {
@@ -662,6 +740,32 @@ function logEventSummary(event) {
   }
 }
 
+function buildEventDedupKey(ev) {
+  try {
+    const src = ev?.source || {};
+    const msg = ev?.message || {};
+    // 1) message.id 最佳
+    if (ev?.type === 'message' && msg?.id) return `m:${msg.id}`;
+    // 2) postback data + replyToken
+    if (ev?.type === 'postback') return `p:${ev?.postback?.data || ''}:${ev?.replyToken || ''}`;
+    // 3) fallback：replyToken（有效期短，但足夠去重）
+    if (ev?.replyToken) return `r:${ev.replyToken}`;
+    // 4) 最後：source + timestamp + text（仍可擋住大部分重送）
+    const who = src.type === 'group' ? src.groupId : src.userId;
+    const text = msg?.type === 'text' ? msg.text : '';
+    return `f:${src.type}:${who}:${String(text).slice(0, 50)}`;
+  } catch {
+    return null;
+  }
+}
+
+function buildLockKey(ev) {
+  const src = ev?.source || {};
+  if (src.type === 'group' && src.groupId) return `g:${src.groupId}`;
+  if (src.userId) return `u:${src.userId}`;
+  return 'unknown';
+}
+
 /* ======== Server endpoints ======== */
 const lineConfig = { channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN, channelSecret: LINE_CHANNEL_SECRET };
 app.get('/health', (_req, res) => res.status(200).send('OK'));
@@ -682,13 +786,24 @@ app.use((err, req, res, next) => {
 async function lineHandler(req, res) {
   try {
     const events = req.body?.events || [];
-    res.status(200).send('OK');
+    res.status(200).send('OK'); // ✅ 立刻回 200
 
-    setImmediate(() => {
-      events.forEach(async (ev) => {
+    setImmediate(async () => {
+      // ✅ 這裡改成「有鎖、有去重」的處理
+      for (const ev of events) {
         logEventSummary(ev);
+
+        const dedupKey = buildEventDedupKey(ev);
+        if (isDupEvent(dedupKey)) {
+          console.log('[DEDUP] skip', dedupKey);
+          continue;
+        }
+
+        const lockKey = buildLockKey(ev);
         try {
-          await handleEvent(ev);
+          await withLock(lockKey, async () => {
+            await handleEvent(ev);
+          });
         } catch (err) {
           console.error('[HANDLE EVENT ERROR]', err);
           const token = ev.replyToken;
@@ -703,7 +818,7 @@ async function lineHandler(req, res) {
             }
           }
         }
-      });
+      }
     });
   } catch (e) {
     console.error('[WEBHOOK ERROR]', e);
