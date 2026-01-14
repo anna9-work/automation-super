@@ -5,20 +5,18 @@ import { createClient } from '@supabase/supabase-js';
 
 /**
  * =========================================================
- *  LINE Bot for Inventory（查庫存/出庫）
- *
- * ✅ 你指定的規則：
- *  - 只有「出庫」需要鎖：同一個人同一個品項同一個倉庫，5 秒內只允許一次
- *  - 其他（查詢 / 編號 / 模糊查 / 點選品項 / 點倉庫）一律不鎖
- *
- * ✅ 解卡策略：
- *  - 所有回覆「先 reply（有 replyToken 就用）」；reply 太慢/失敗 → 自動 fallback 改用 push
- *  - 查詢、點選品項、點倉庫都走同一套 sendMsg（reply→push）
- *
- *  - 查詢：只在「當日有庫存（約 200 筆）」內做關鍵字比對（快取 3 秒）
- *  - 快照：public.get_business_day_stock
+ *  LINE Bot for Inventory（快回 + 去重 + 只有出庫鎖 5 秒）
+ *  - 查詢：只在「當日有庫存（約 200 筆）」內做關鍵字比對（快）
+ *  - 快照：public.get_business_day_stock（與試算表一致）
  *  - 出庫：fifo_out_and_log（單一交易）
- *  - biz_date：台北 05:00 切日
+ *  - 支援 message + postback
+ *  - webhook 立刻回 200（避免 LINE 重送）
+ *
+ *  ✅ 重點修正：
+ *  A) 只對「出庫」做 per-user lock（5 秒），查詢/選倉/點品項不鎖
+ *  B) 事件去重（webhookEventId / message.id）避免 LINE 重送造成卡與重複處理
+ *  C) reply 失敗 → 自動 push fallback（可 push 到 groupId 或 userId）
+ *  D) Supabase / LINE / GAS 全部加 timeout，避免卡死
  * =========================================================
  */
 
@@ -37,15 +35,31 @@ const {
 if (!LINE_CHANNEL_ACCESS_TOKEN || !LINE_CHANNEL_SECRET) console.error('缺少 LINE 環境變數');
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) console.error('缺少 Supabase 環境變數 (URL / SERVICE_ROLE_KEY)');
 
-const BOT_VER = 'V2026-01-14_OUT_LOCK_5S_ONLY_REPLY_PUSH_FALLBACK';
-const SUPA_TIMEOUT_MS = 8000; // 不中斷，只是避免 await 卡太久，超時就丟錯讓上層 fallback
+const BOT_VER = 'V2026-01-14_OUT_LOCK_5S_ONLY_REPLY_PUSH_FALLBACK_DEDUP_TIMEOUT';
+
+/* ======== Timeouts ======== */
+const SUPA_TIMEOUT_MS = 8000; // Supabase RPC timeout
+const LINE_TIMEOUT_MS = 8000; // LINE reply/push timeout
+const GAS_TIMEOUT_MS = 6000;  // GAS webhook timeout
+
+/* ======== Utilities: timeout fetch wrapper ======== */
+async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: ctrl.signal });
+    return res;
+  } finally {
+    clearTimeout(t);
+  }
+}
 
 /* ======== App / Supabase ======== */
-const app = express(); // ⚠️ webhook 前不可掛 body parser
-const START_MS = Date.now();
+const app = express(); // webhook 前不可掛 body parser
 
+const STARTED_AT = Date.now();
 app.use((req, _res, next) => {
-  const up = ((Date.now() - START_MS) / 1000).toFixed(1);
+  const up = ((Date.now() - STARTED_AT) / 1000).toFixed(1);
   console.log(
     `[請求] ${req.method} ${req.path} up=${up}s ua=${req.headers['user-agent'] || ''} x-line-signature=${
       req.headers['x-line-signature'] ? 'yes' : 'no'
@@ -54,9 +68,15 @@ app.use((req, _res, next) => {
   next();
 });
 
+const lineConfig = { channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN, channelSecret: LINE_CHANNEL_SECRET };
 const client = new line.Client({ channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN });
+
+// Supabase: 用自訂 fetch 加 timeout（避免卡死）
 const supabase = createClient(SUPABASE_URL.replace(/\/+$/, ''), SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
+  global: {
+    fetch: (url, options) => fetchWithTimeout(url, options, SUPA_TIMEOUT_MS),
+  },
 });
 
 function getSupabaseHost() {
@@ -71,16 +91,21 @@ const SUPA_HOST = getSupabaseHost();
 
 /* ======== Runtime caches ======== */
 const LAST_WAREHOUSE_CODE_BY_USER_BRANCH = new Map(); // key=`${userId}::${branch}` -> warehouse_code
-const LAST_SKU_BY_USER_BRANCH = new Map(); // key=`${userId}::${branch}` -> sku(lower)
+const LAST_SKU_BY_USER_BRANCH = new Map();            // key=`${userId}::${branch}` -> sku(lower)
 
 const WH_LABEL_CACHE = new Map(); // key: kind_id 或 kind_name → kind_name（中文）
-const WH_CODE_CACHE = new Map(); // key: kind_name（中文） → kind_id（代碼）
+const WH_CODE_CACHE = new Map();  // key: kind_name（中文） → kind_id（代碼）
 
-/* ✅ 查詢快取：當天有庫存清單（200筆） */
+// 當日庫存清單快取（3 秒）
 const STOCK_LIST_CACHE = new Map(); // key=`${branch}::${bizDate}` -> { ts, rows }
 
-/* ✅ 只有出庫要鎖：5 秒 */
-const OUT_LOCK = new Map(); // key -> lockUntilMs
+// 事件去重（2 分鐘）
+const EVENT_DEDUP = new Map(); // id -> ts
+const EVENT_DEDUP_TTL_MS = 2 * 60 * 1000;
+
+// 出庫鎖（只鎖出庫，5 秒）
+const OUT_LOCK = new Map(); // key=`${userId}::${branch}` -> untilMs
+const OUT_LOCK_MS = 5000;
 
 /* ======== Fixed warehouse labels (code -> 中文) ======== */
 const FIX_CODE_TO_NAME = new Map([
@@ -126,73 +151,22 @@ function tpeNowISO() {
   return s.replace(' ', 'T') + '+08:00';
 }
 
-function nowUpStr() {
-  const up = ((Date.now() - START_MS) / 1000).toFixed(1);
-  return `up=${up}s`;
-}
-
-function getDestinationFromEvent(event) {
-  const src = event?.source || {};
-  if (src.type === 'group' && src.groupId) return { to: src.groupId, toType: `group:${src.groupId.slice(0, 6)}...` };
-  if (src.type === 'room' && src.roomId) return { to: src.roomId, toType: `room:${src.roomId.slice(0, 6)}...` };
-  if (src.userId) return { to: src.userId, toType: `user:${src.userId.slice(0, 6)}...` };
-  return { to: null, toType: 'unknown' };
-}
-
-function withTimeout(promise, ms, label = 'timeout') {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => setTimeout(() => reject(new Error(label)), ms)),
-  ]);
-}
-
-/**
- * ✅ 核心送訊息：優先 reply（快），reply 超時/失敗 -> fallback push
- * - 這就是你現在「常常沒回」的解法：不要死等 replyToken
- */
-async function sendMsg(event, msg, opt = {}) {
-  const { preferReply = true, replyTimeoutMs = 1200 } = opt;
-  const token = event?.replyToken || null;
-  const { to, toType } = getDestinationFromEvent(event);
-
-  // 沒有目的地就放棄（理論上不會）
-  if (!token && !to) return;
-
-  // 先試 reply（但最多等 1.2 秒）
-  if (preferReply && token) {
-    try {
-      const t0 = Date.now();
-      await withTimeout(client.replyMessage(token, msg), replyTimeoutMs, 'reply_timeout');
-      console.log(`[線路回覆] ok ms=${Date.now() - t0} ${nowUpStr()}`);
-      return;
-    } catch (e) {
-      console.warn(`[線路回覆] fail (${e?.message || e}) -> fallback push ${toType} ${nowUpStr()}`);
-    }
-  }
-
-  // fallback push
-  if (to) {
-    try {
-      const t0 = Date.now();
-      await client.pushMessage(to, msg);
-      console.log(`[LINE PUSH] ok ms=${Date.now() - t0} to=${toType} ${nowUpStr()}`);
-    } catch (e2) {
-      console.error(`[LINE PUSH] fail to=${toType} err=${e2?.message || e2} ${nowUpStr()}`);
-    }
+/* ======== Dedup ======== */
+function gcDedup() {
+  const now = Date.now();
+  for (const [k, ts] of EVENT_DEDUP.entries()) {
+    if (now - ts > EVENT_DEDUP_TTL_MS) EVENT_DEDUP.delete(k);
   }
 }
 
-async function supaRpc(name, args) {
-  const t0 = Date.now();
-  const p = supabase.rpc(name, args);
-  const { data, error } = await withTimeout(p, SUPA_TIMEOUT_MS, `supa_${name}_timeout`);
-  const ms = Date.now() - t0;
-  if (error) {
-    console.warn(`[RPC] ${name} error ms=${ms} msg=${error.message}`);
-    throw error;
-  }
-  console.log(`[RPC] ${name} ok ms=${ms}`);
-  return data;
+function getEventDedupId(ev) {
+  // LINE v2 常見：webhookEventId（最可靠）
+  if (ev?.webhookEventId) return `weid:${ev.webhookEventId}`;
+  // message.id 也可（同一訊息重送仍會一致）
+  if (ev?.message?.id) return `mid:${ev.message.id}`;
+  // 最後退回：replyToken（不一定穩定）
+  if (ev?.replyToken) return `rt:${ev.replyToken}`;
+  return null;
 }
 
 /* ======== Warehouse resolvers（對齊 warehouse_kinds） ======== */
@@ -231,7 +205,7 @@ async function getWarehouseCodeForLabel(displayNameOrCode) {
   const label = String(displayNameOrCode || '').trim();
   if (!label) return 'unspecified';
 
-  // code 直接回（含 main / withdraw / swap / unspecified）
+  // code 直接回
   if (/^[a-z0-9_]+$/i.test(label)) {
     if (FIX_CODE_TO_NAME.has(label)) return label;
     try {
@@ -250,10 +224,8 @@ async function getWarehouseCodeForLabel(displayNameOrCode) {
     return label.toLowerCase();
   }
 
-  // 中文→code cache
   if (WH_CODE_CACHE.has(label)) return WH_CODE_CACHE.get(label);
 
-  // 固定表 reverse
   for (const [code, name] of FIX_CODE_TO_NAME.entries()) {
     if (name === label) {
       WH_CODE_CACHE.set(name, code);
@@ -261,7 +233,6 @@ async function getWarehouseCodeForLabel(displayNameOrCode) {
     }
   }
 
-  // DB 查詢（kind_name -> kind_id）
   try {
     const { data } = await supabase
       .from('warehouse_kinds')
@@ -335,6 +306,69 @@ async function autoRegisterUser(lineUserId) {
     await supabase.from('users').insert({ user_id: lineUserId, 群組: DEFAULT_GROUP, 角色: 'user', 黑名單: false });
 }
 
+/* ======== Last product helpers ======== */
+function setLastSku(lineUserId, branch, sku) {
+  if (!lineUserId) return;
+  LAST_SKU_BY_USER_BRANCH.set(`${lineUserId}::${branch}`, skuKey(sku));
+}
+function getLastSku(lineUserId, branch) {
+  if (!lineUserId) return null;
+  const mem = LAST_SKU_BY_USER_BRANCH.get(`${lineUserId}::${branch}`);
+  return mem ? skuKey(mem) : null;
+}
+
+/* ======== LINE reply/push with timeout + fallback ======== */
+async function lineReplyWithTimeout(replyToken, message) {
+  const t0 = Date.now();
+  const p = client.replyMessage(replyToken, message);
+  const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('LINE reply timeout')), LINE_TIMEOUT_MS));
+  await Promise.race([p, timeout]);
+  return Date.now() - t0;
+}
+
+async function linePushWithTimeout(to, message) {
+  const t0 = Date.now();
+  const p = client.pushMessage(to, message);
+  const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('LINE push timeout')), LINE_TIMEOUT_MS));
+  await Promise.race([p, timeout]);
+  return Date.now() - t0;
+}
+
+async function replyOrPush(event, message) {
+  const up = ((Date.now() - STARTED_AT) / 1000).toFixed(1);
+  const replyToken = event?.replyToken || null;
+  const src = event?.source || {};
+  const isGroup = src.type === 'group';
+  const isRoom = src.type === 'room';
+  const userId = src.userId || null;
+  const groupId = src.groupId || null;
+  const roomId = src.roomId || null;
+
+  // 先嘗試 reply（最快）
+  if (replyToken) {
+    try {
+      const ms = await lineReplyWithTimeout(replyToken, message);
+      console.log(`[線路回覆] ok ms=${ms} up=${up}s`);
+      return true;
+    } catch (e) {
+      console.warn('[線路回覆] fail -> push fallback:', e?.message || e);
+    }
+  }
+
+  // reply 失敗 -> push
+  const to = isGroup ? groupId : isRoom ? roomId : userId;
+  if (to) {
+    try {
+      const ms = await linePushWithTimeout(to, message);
+      console.log(`[LINE PUSH] ok ms=${ms} to=${isGroup ? 'group' : isRoom ? 'room' : 'user'}:${String(to).slice(0, 12)}...`);
+      return true;
+    } catch (e2) {
+      console.error('[LINE PUSH] fail:', e2?.message || e2);
+    }
+  }
+  return false;
+}
+
 /* ======== 業務日結存：單一 SKU（快照） ======== */
 async function getWarehouseStockBySku(branch, sku) {
   const group = String(branch || '').trim().toLowerCase();
@@ -346,12 +380,19 @@ async function getWarehouseStockBySku(branch, sku) {
   console.log(`[DB] host=${SUPA_HOST} ver=${BOT_VER}`);
   console.log(`[庫存 RPC] group=${group} bizDate=${bizDate} sku=${s} stage=before`);
 
-  const data = await supaRpc('get_business_day_stock', {
+  const t0 = Date.now();
+  const { data, error } = await supabase.rpc('get_business_day_stock', {
     p_group: group,
     p_biz_date: bizDate,
     p_sku: s,
     p_warehouse_code: null,
   });
+  const ms = Date.now() - t0;
+  if (error) {
+    console.log(`[庫存 RPC] error ms=${ms} msg=${error.message}`);
+    throw error;
+  }
+  console.log(`[RPC] 取得業務日庫存成功，耗時 ${ms} 毫秒`);
 
   const rows = Array.isArray(data) ? data : [];
   const keptRaw = rows
@@ -373,7 +414,9 @@ async function getWarehouseStockBySku(branch, sku) {
   );
 
   console.log(
-    `[庫存 RPC] stage=after rows=${rows.length} kept=${kept.length} wh=${kept.map((x) => `${x.warehouseCode}:${x.box}/${x.piece}`).join(',')}`,
+    `[庫存 RPC] stage=after rows=${rows.length} kept=${kept.length} wh=${kept
+      .map((x) => `${x.warehouseCode}:${x.box}/${x.piece}`)
+      .join(',')}`,
   );
 
   return kept;
@@ -386,13 +429,13 @@ async function getWarehouseSnapshot(branch, sku, warehouseCodeOrLabel) {
   const bizDate = getBizDate0500TPE();
 
   console.log(`[DB] host=${SUPA_HOST} ver=${BOT_VER}`);
-
-  const data = await supaRpc('get_business_day_stock', {
+  const { data, error } = await supabase.rpc('get_business_day_stock', {
     p_group: group,
     p_biz_date: bizDate,
     p_sku: s,
     p_warehouse_code: whCode,
   });
+  if (error) throw error;
 
   const row = Array.isArray(data) ? data[0] : data;
 
@@ -436,19 +479,18 @@ async function getTodayStockRows(branch) {
   if (cached && Date.now() - cached.ts < 3000) return cached.rows; // 3 秒快取
 
   console.log(`[DB] host=${SUPA_HOST} ver=${BOT_VER}`);
-
   const t0 = Date.now();
-  const data = await supaRpc('daily_sheet_rows_full', {
-    p_biz_date: bizDate,
-    p_group: group,
-  });
+  const { data, error } = await supabase.rpc('daily_sheet_rows_full', { p_biz_date: bizDate, p_group: group });
+  const ms = Date.now() - t0;
+  if (error) throw error;
+  console.log(`[RPC] daily_sheet_rows_full ok ms=${ms}`);
 
   const rows = Array.isArray(data) ? data : [];
   const kept = rows.filter((r) => pickNum(r['庫存箱數'] ?? 0, 0) > 0 || pickNum(r['庫存散數'] ?? 0, 0) > 0);
 
-  STOCK_LIST_CACHE.set(key, { ts: Date.now(), rows: kept });
+  console.log(`[庫存清單] rpc ok ms=${ms} 行=${rows.length} 保留=${kept.length}`);
 
-  console.log(`[庫存清單] rpc ok ms=${Date.now() - t0} rows=${rows.length} kept=${kept.length}`);
+  STOCK_LIST_CACHE.set(key, { ts: Date.now(), rows: kept });
   return kept;
 }
 
@@ -629,7 +671,8 @@ async function callOutOnceTx({ branch, sku, outBox, outPiece, warehouseCode, lin
   };
 
   console.log(`[DB] host=${SUPA_HOST} ver=${BOT_VER}`);
-  const data = await supaRpc('fifo_out_and_log', args);
+  const { data, error } = await supabase.rpc('fifo_out_and_log', args);
+  if (error) throw error;
 
   const row = Array.isArray(data) ? data[0] : data;
   return {
@@ -645,17 +688,61 @@ async function callOutOnceTx({ branch, sku, outBox, outPiece, warehouseCode, lin
 /* ======== GAS Webhook (optional, fire-and-forget) ======== */
 let GAS_URL_CACHE = (ENV_GAS_URL || '').trim();
 let GAS_SECRET_CACHE = (ENV_GAS_SECRET || '').trim();
+let GAS_LOADED_ONCE = false;
+let GAS_LAST_LOAD_MS = 0;
+
+async function loadGasConfigFromDBIfNeeded(force = false) {
+  const now = Date.now();
+  const hasCache = GAS_URL_CACHE && GAS_SECRET_CACHE;
+  if (!force && hasCache && GAS_LOADED_ONCE && now - GAS_LAST_LOAD_MS < 5 * 60 * 1000) return;
+
+  try {
+    const { data, error } = await supabase.rpc('get_app_settings', {
+      keys: ['gas_webhook_url', 'gas_webhook_secret'],
+    });
+    if (error) throw error;
+    if (Array.isArray(data)) {
+      for (const row of data) {
+        const k = String(row.key || '').trim();
+        const v = String(row.value || '').trim();
+        if (k === 'gas_webhook_url' && v) GAS_URL_CACHE = v;
+        if (k === 'gas_webhook_secret' && v) GAS_SECRET_CACHE = v;
+      }
+    }
+    GAS_LOADED_ONCE = true;
+    GAS_LAST_LOAD_MS = now;
+    console.log('[GAS CONFIG] url =', GAS_URL_CACHE ? GAS_URL_CACHE.slice(0, 80) : '(empty)');
+  } catch (e) {
+    GAS_LOADED_ONCE = true;
+    GAS_LAST_LOAD_MS = now;
+    console.warn('⚠️ 載入 GAS 設定失敗（RPC get_app_settings）：', e?.message || e);
+  }
+}
+
+async function getGasConfig() {
+  if (!GAS_LOADED_ONCE || !GAS_URL_CACHE || !GAS_SECRET_CACHE) await loadGasConfigFromDBIfNeeded(true);
+  return { url: GAS_URL_CACHE, secret: GAS_SECRET_CACHE };
+}
 
 async function postInventoryToGAS(payload) {
-  if (!GAS_URL_CACHE || !GAS_SECRET_CACHE) return;
-  const cleanBaseUrl = GAS_URL_CACHE.replace(/\?.*$/, '');
-  const callUrl = `${cleanBaseUrl}?secret=${encodeURIComponent(GAS_SECRET_CACHE)}`;
+  const { url, secret } = await getGasConfig();
+  if (!url || !secret) {
+    console.warn('⚠️ GAS 未設定（略過推送）');
+    return;
+  }
+  const cleanBaseUrl = url.replace(/\?.*$/, '');
+  const callUrl = `${cleanBaseUrl}?secret=${encodeURIComponent(secret)}`;
   try {
-    const res = await fetch(callUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
+    console.log('[GAS CALL]', cleanBaseUrl);
+    const res = await fetchWithTimeout(
+      callUrl,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      },
+      GAS_TIMEOUT_MS,
+    );
     if (!res.ok) {
       const txt = await res.text().catch(() => '');
       console.warn('[GAS WARN]', res.status, txt);
@@ -665,18 +752,7 @@ async function postInventoryToGAS(payload) {
   }
 }
 
-/* ======== Last product helpers ======== */
-function setLastSku(lineUserId, branch, sku) {
-  if (!lineUserId) return;
-  LAST_SKU_BY_USER_BRANCH.set(`${lineUserId}::${branch}`, skuKey(sku));
-}
-function getLastSku(lineUserId, branch) {
-  if (!lineUserId) return null;
-  const mem = LAST_SKU_BY_USER_BRANCH.get(`${lineUserId}::${branch}`);
-  return mem ? skuKey(mem) : null;
-}
-
-/* ======== Utilities ======== */
+/* ======== Event logging ======== */
 function logEventSummary(event) {
   try {
     const src = event?.source || {};
@@ -688,20 +764,22 @@ function logEventSummary(event) {
         isGroup ? src.groupId : '-'
       } roomId=${isRoom ? src.roomId : '-'} userId=${src.userId || '-'} text="${msg?.type === 'text' ? msg.text : ''}"`,
     );
-    if (event?.type === 'postback') console.log(`[LINE POSTBACK] data=${event?.postback?.data || ''}`);
+    if (event?.type === 'postback') {
+      console.log(`[LINE POSTBACK] data=${event?.postback?.data || ''}`);
+    }
   } catch (e) {
     console.error('[LINE EVENT LOG ERROR]', e);
   }
 }
 
 /* ======== Server endpoints ======== */
-const lineConfig = { channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN, channelSecret: LINE_CHANNEL_SECRET };
 app.get('/health', (_req, res) => res.status(200).send('OK'));
 app.get('/', (_req, res) => res.status(200).send('RUNNING'));
 app.get('/webhook', (_req, res) => res.status(200).send('OK'));
 app.get('/line/webhook', (_req, res) => res.status(200).send('OK'));
 app.post('/webhook', line.middleware(lineConfig), lineHandler);
 app.post('/line/webhook', line.middleware(lineConfig), lineHandler);
+
 app.use((err, req, res, next) => {
   if (req.path === '/webhook' || req.path === '/line/webhook') {
     console.error('[LINE MIDDLEWARE ERROR]', err?.message || err);
@@ -718,13 +796,27 @@ async function lineHandler(req, res) {
 
     setImmediate(() => {
       events.forEach(async (ev) => {
+        // 去重
+        gcDedup();
+        const did = getEventDedupId(ev);
+        if (did) {
+          if (EVENT_DEDUP.has(did)) {
+            console.log(`[DEDUP] skip ${did}`);
+            return;
+          }
+          EVENT_DEDUP.set(did, Date.now());
+        }
+
         logEventSummary(ev);
+
         try {
           await handleEvent(ev);
         } catch (err) {
           console.error('[HANDLE EVENT ERROR]', err);
-          // 這裡也用 fallback：避免 replyToken 失效造成你覺得「沒回」
-          await sendMsg(ev, { type: 'text', text: `系統忙碌或發生錯誤：${err?.message || '未知錯誤'}` }, { preferReply: true });
+          await replyOrPush(ev, {
+            type: 'text',
+            text: `系統忙碌或發生錯誤：${err?.message || '未知錯誤'}`,
+          });
         }
       });
     });
@@ -734,20 +826,6 @@ async function lineHandler(req, res) {
       return res.status(200).send('OK');
     } catch {}
   }
-}
-
-/* ======== 出庫鎖（只鎖出庫，5 秒） ======== */
-function outLockKey({ branch, lineUserId, sku, whCode }) {
-  return `${String(branch || '').toLowerCase()}::${String(lineUserId || '')}::${skuKey(sku)}::${String(whCode || 'unspecified')}`;
-}
-function isOutLocked(key) {
-  const until = OUT_LOCK.get(key) || 0;
-  if (Date.now() < until) return true;
-  OUT_LOCK.delete(key);
-  return false;
-}
-function setOutLock(key, ms = 5000) {
-  OUT_LOCK.set(key, Date.now() + ms);
 }
 
 /* ======== Event logic ======== */
@@ -760,21 +838,22 @@ async function handleEvent(event) {
 
   const { branch, role, blocked, needBindMsg } = await resolveBranchAndRole(event);
   if (blocked) return;
+
   if (!branch) {
-    await sendMsg(event, { type: 'text', text: needBindMsg || '尚未綁定分店' }, { preferReply: true });
+    await replyOrPush(event, { type: 'text', text: needBindMsg || '尚未綁定分店' });
     return;
   }
 
-  // ✅ db 指令
+  // db 指令
   if (event.type === 'message' && event.message.type === 'text') {
     const parsed0 = parseCommand(event.message.text || '');
     if (parsed0?.type === 'db') {
       const bizDate = getBizDate0500TPE();
-      await sendMsg(
-        event,
-        { type: 'text', text: `BOT=${BOT_VER}\nDB_HOST=${SUPA_HOST}\nBIZ_DATE_0500=${bizDate}\nSUPA_TIMEOUT_MS=${SUPA_TIMEOUT_MS}\n${nowUpStr()}` },
-        { preferReply: true },
-      );
+      const up = ((Date.now() - STARTED_AT) / 1000).toFixed(1);
+      await replyOrPush(event, {
+        type: 'text',
+        text: `BOT=${BOT_VER}\nDB_HOST=${SUPA_HOST}\nBIZ_DATE_0500=${bizDate}\nSUPA_TIMEOUT_MS=${SUPA_TIMEOUT_MS}\nUPTIME=${up}s`,
+      });
       return;
     }
   }
@@ -787,7 +866,7 @@ async function handleEvent(event) {
     if (pb.type === 'wh_select_postback') {
       const sku = pb.sku || getLastSku(lineUserId, branch);
       if (!sku) {
-        await sendMsg(event, { type: 'text', text: '請先選商品（查/編號）再選倉庫' }, { preferReply: true });
+        await replyOrPush(event, { type: 'text', text: '請先選商品（查/編號）再選倉庫' });
         return;
       }
 
@@ -795,11 +874,10 @@ async function handleEvent(event) {
       LAST_WAREHOUSE_CODE_BY_USER_BRANCH.set(`${lineUserId}::${branch}`, whCode);
 
       const snap = await getWarehouseSnapshot(branch, sku, whCode);
-      await sendMsg(
-        event,
-        { type: 'text', text: `編號：${skuDisplay(sku)}\n倉庫類別：${snap.warehouseLabel}\n庫存：${snap.box}箱${snap.piece}散` },
-        { preferReply: true },
-      );
+      await replyOrPush(event, {
+        type: 'text',
+        text: `編號：${skuDisplay(sku)}\n倉庫類別：${snap.warehouseLabel}\n庫存：${snap.box}箱${snap.piece}散`,
+      });
       return;
     }
     return;
@@ -815,7 +893,7 @@ async function handleEvent(event) {
   if (parsed.type === 'wh_select') {
     const sku = getLastSku(lineUserId, branch);
     if (!sku) {
-      await sendMsg(event, { type: 'text', text: '請先選商品（查/編號）再選倉庫' }, { preferReply: true });
+      await replyOrPush(event, { type: 'text', text: '請先選商品（查/編號）再選倉庫' });
       return;
     }
 
@@ -823,11 +901,10 @@ async function handleEvent(event) {
     LAST_WAREHOUSE_CODE_BY_USER_BRANCH.set(`${lineUserId}::${branch}`, whCode);
 
     const snap = await getWarehouseSnapshot(branch, sku, whCode);
-    await sendMsg(
-      event,
-      { type: 'text', text: `編號：${skuDisplay(sku)}\n倉庫類別：${snap.warehouseLabel}\n庫存：${snap.box}箱${snap.piece}散` },
-      { preferReply: true },
-    );
+    await replyOrPush(event, {
+      type: 'text',
+      text: `編號：${skuDisplay(sku)}\n倉庫類別：${snap.warehouseLabel}\n庫存：${snap.box}箱${snap.piece}散`,
+    });
     return;
   }
 
@@ -836,54 +913,49 @@ async function handleEvent(event) {
     const sku = skuKey(p.sku);
     const whList = await getWarehouseStockBySku(branch, sku);
     if (!whList.length) {
-      await sendMsg(event, { type: 'text', text: '無此商品庫存' }, { preferReply: true });
+      await replyOrPush(event, { type: 'text', text: '無此商品庫存' });
       return;
     }
 
     setLastSku(lineUserId, branch, sku);
 
     if (whList.length >= 2) {
-      await sendMsg(
-        event,
-        {
-          type: 'text',
-          text: `名稱：${p.name}\n編號：${skuDisplay(sku)}\n👉請選擇倉庫`,
-          quickReply: buildQuickReplyForWarehousesForQuery(whList),
-        },
-        { preferReply: true },
-      );
+      await replyOrPush(event, {
+        type: 'text',
+        text: `名稱：${p.name}\n編號：${skuDisplay(sku)}\n👉請選擇倉庫`,
+        quickReply: buildQuickReplyForWarehousesForQuery(whList),
+      });
       return;
     }
 
     const chosen = whList[0];
     LAST_WAREHOUSE_CODE_BY_USER_BRANCH.set(`${lineUserId}::${branch}`, chosen.warehouseCode);
 
-    await sendMsg(
-      event,
-      {
-        type: 'text',
-        text: `名稱：${p.name}\n編號：${skuDisplay(sku)}\n箱入數：${p.unitsPerBox}\n單價：${p.price}\n倉庫類別：${chosen.warehouseLabel}\n庫存：${chosen.box}箱${chosen.piece}散`,
-      },
-      { preferReply: true },
-    );
+    await replyOrPush(event, {
+      type: 'text',
+      text:
+        `名稱：${p.name}\n編號：${skuDisplay(sku)}\n箱入數：${p.unitsPerBox}\n單價：${p.price}\n` +
+        `倉庫類別：${chosen.warehouseLabel}\n庫存：${chosen.box}箱${chosen.piece}散`,
+    });
   };
 
   // 查 關鍵字
   if (parsed.type === 'query') {
     const list = await searchByNameInStock(parsed.keyword, branch);
     if (!list.length) {
-      await sendMsg(event, { type: 'text', text: '無此商品庫存' }, { preferReply: true });
+      await replyOrPush(event, { type: 'text', text: '無此商品庫存' });
       return;
     }
 
     if (list.length > 1) {
-      await sendMsg(
-        event,
-        { type: 'text', text: `找到以下與「${parsed.keyword}」相關的庫存品項`, quickReply: buildQuickReplyForProducts(list) },
-        { preferReply: true },
-      );
+      await replyOrPush(event, {
+        type: 'text',
+        text: `找到以下與「${parsed.keyword}」相關的庫存品項`,
+        quickReply: buildQuickReplyForProducts(list),
+      });
       return;
     }
+
     await doQueryCommon(list[0]);
     return;
   }
@@ -892,18 +964,19 @@ async function handleEvent(event) {
   if (parsed.type === 'sku') {
     const list = await searchBySkuInStock(parsed.sku, branch);
     if (!list.length) {
-      await sendMsg(event, { type: 'text', text: '無此商品庫存' }, { preferReply: true });
+      await replyOrPush(event, { type: 'text', text: '無此商品庫存' });
       return;
     }
 
     if (list.length > 1) {
-      await sendMsg(
-        event,
-        { type: 'text', text: `找到以下與「${parsed.sku}」相關的庫存品項`, quickReply: buildQuickReplyForProducts(list) },
-        { preferReply: true },
-      );
+      await replyOrPush(event, {
+        type: 'text',
+        text: `找到以下與「${parsed.sku}」相關的庫存品項`,
+        quickReply: buildQuickReplyForProducts(list),
+      });
       return;
     }
+
     await doQueryCommon(list[0]);
     return;
   }
@@ -912,111 +985,115 @@ async function handleEvent(event) {
   if (parsed.type === 'change') {
     if (parsed.action === 'in') {
       if (role !== '主管') {
-        await sendMsg(event, { type: 'text', text: '您無法使用「入庫」' }, { preferReply: true });
+        await replyOrPush(event, { type: 'text', text: '您無法使用「入庫」' });
         return;
       }
-      await sendMsg(event, { type: 'text', text: '入庫請改用 App 進行；LINE 僅提供出庫' }, { preferReply: true });
+      await replyOrPush(event, { type: 'text', text: '入庫請改用 App 進行；LINE 僅提供出庫' });
       return;
     }
 
-    const outBox = parsed.box || 0;
-    const outPiece = parsed.piece || 0;
-    if (outBox === 0 && outPiece === 0) return;
-
-    const skuLast = getLastSku(lineUserId, branch);
-    if (!skuLast) {
-      await sendMsg(event, { type: 'text', text: '請先用「查 商品」或「編號」選定「有庫存」商品後再出庫。' }, { preferReply: true });
+    // ✅ 只有出庫才鎖 5 秒（同 user + branch）
+    const lockKey = `${lineUserId || 'no_user'}::${branch}`;
+    const now = Date.now();
+    const until = OUT_LOCK.get(lockKey) || 0;
+    if (now < until) {
+      await replyOrPush(event, { type: 'text', text: '⚠️ 出庫處理中，請稍後再試一次（5 秒內）' });
       return;
     }
-
-    const whList = await getWarehouseStockBySku(branch, skuLast);
-    if (!whList.length) {
-      await sendMsg(event, { type: 'text', text: '所有倉庫皆無庫存，無法出庫。' }, { preferReply: true });
-      return;
-    }
-
-    const lastWhKey = `${lineUserId || ''}::${branch}`;
-    const lastWhCode = LAST_WAREHOUSE_CODE_BY_USER_BRANCH.get(lastWhKey) || null;
-
-    let chosenWhCode = null;
-
-    if (parsed.warehouse) {
-      chosenWhCode = await getWarehouseCodeForLabel(parsed.warehouse);
-    } else if (lastWhCode) {
-      const matched = whList.find((w) => w.warehouseCode === lastWhCode);
-      if (matched) chosenWhCode = matched.warehouseCode;
-    }
-
-    if (!chosenWhCode) {
-      if (whList.length >= 2) {
-        await sendMsg(
-          event,
-          { type: 'text', text: '請選擇要出庫的倉庫', quickReply: buildQuickReplyForWarehouses('出', whList, outBox, outPiece) },
-          { preferReply: true },
-        );
-        return;
-      }
-      chosenWhCode = whList[0].warehouseCode;
-    }
-
-    LAST_WAREHOUSE_CODE_BY_USER_BRANCH.set(lastWhKey, chosenWhCode);
-
-    // ✅ 只有出庫鎖：5 秒（同人+同分店+同sku+同倉）
-    const lockKey = outLockKey({ branch, lineUserId, sku: skuLast, whCode: chosenWhCode });
-    if (isOutLocked(lockKey)) {
-      await sendMsg(event, { type: 'text', text: '出庫處理中，請 5 秒後再試一次（避免重複扣庫）' }, { preferReply: true });
-      return;
-    }
-    setOutLock(lockKey, 5000);
+    OUT_LOCK.set(lockKey, now + OUT_LOCK_MS);
 
     try {
+      const outBox = parsed.box || 0;
+      const outPiece = parsed.piece || 0;
+      if (outBox === 0 && outPiece === 0) return;
+
+      const skuLast = getLastSku(lineUserId, branch);
+      if (!skuLast) {
+        await replyOrPush(event, { type: 'text', text: '請先用「查 商品」或「編號」選定「有庫存」商品後再出庫。' });
+        return;
+      }
+
+      const whList = await getWarehouseStockBySku(branch, skuLast);
+      if (!whList.length) {
+        await replyOrPush(event, { type: 'text', text: '所有倉庫皆無庫存，無法出庫。' });
+        return;
+      }
+
+      const lastWhKey = `${lineUserId || ''}::${branch}`;
+      const lastWhCode = LAST_WAREHOUSE_CODE_BY_USER_BRANCH.get(lastWhKey) || null;
+
+      let chosenWhCode = null;
+      if (parsed.warehouse) {
+        chosenWhCode = await getWarehouseCodeForLabel(parsed.warehouse);
+      } else if (lastWhCode) {
+        const matched = whList.find((w) => w.warehouseCode === lastWhCode);
+        if (matched) chosenWhCode = matched.warehouseCode;
+      }
+
+      if (!chosenWhCode) {
+        if (whList.length >= 2) {
+          await replyOrPush(event, {
+            type: 'text',
+            text: '請選擇要出庫的倉庫',
+            quickReply: buildQuickReplyForWarehouses('出', whList, outBox, outPiece),
+          });
+          return;
+        }
+        chosenWhCode = whList[0].warehouseCode;
+      }
+
+      LAST_WAREHOUSE_CODE_BY_USER_BRANCH.set(lastWhKey, chosenWhCode);
+
       // 出庫前 requery
       const snapBefore = await getWarehouseSnapshot(branch, skuLast, chosenWhCode);
       const curBox = snapBefore.box || 0;
       const curPiece = snapBefore.piece || 0;
 
       if (outBox > 0 && curBox < outBox) {
-        await sendMsg(
-          event,
-          { type: 'text', text: `庫存不足，無法出庫（倉別：${snapBefore.warehouseLabel}）\n目前庫存：${curBox}箱${curPiece}散` },
-          { preferReply: true },
-        );
+        await replyOrPush(event, {
+          type: 'text',
+          text: `庫存不足，無法出庫（倉別：${snapBefore.warehouseLabel}）\n目前庫存：${curBox}箱${curPiece}散`,
+        });
         return;
       }
       if (outPiece > 0 && curPiece < outPiece) {
-        await sendMsg(
-          event,
-          { type: 'text', text: `庫存不足，無法出庫（倉別：${snapBefore.warehouseLabel}）\n目前庫存：${curBox}箱${curPiece}散` },
-          { preferReply: true },
-        );
+        await replyOrPush(event, {
+          type: 'text',
+          text: `庫存不足，無法出庫（倉別：${snapBefore.warehouseLabel}）\n目前庫存：${curBox}箱${curPiece}散`,
+        });
         return;
       }
 
-      const result = await callOutOnceTx({
-        branch,
-        sku: skuLast,
-        outBox,
-        outPiece,
-        warehouseCode: chosenWhCode,
-        lineUserId,
-      });
+      // 出庫交易
+      let result;
+      try {
+        result = await callOutOnceTx({
+          branch,
+          sku: skuLast,
+          outBox,
+          outPiece,
+          warehouseCode: chosenWhCode,
+          lineUserId,
+        });
+      } catch (err) {
+        console.error('[fifo_out_and_log ERROR]', err);
+        await replyOrPush(event, { type: 'text', text: `操作失敗：${err?.message || '未知錯誤'}` });
+        return;
+      }
 
       // 出庫後再查一次
       const snapAfter = await getWarehouseSnapshot(branch, skuLast, chosenWhCode);
       const whLabel = snapAfter.warehouseLabel;
 
-      await sendMsg(
-        event,
-        {
-          type: 'text',
-          text: `✅ 出庫成功\n編號：${skuDisplay(skuLast)}\n倉別：${whLabel}\n出庫：${Number(result.outBox || outBox)}箱 ${Number(
+      await replyOrPush(event, {
+        type: 'text',
+        text:
+          `✅ 出庫成功\n編號：${skuDisplay(skuLast)}\n倉別：${whLabel}\n出庫：${Number(result.outBox || outBox)}箱 ${Number(
             result.outPiece || outPiece,
           )}件\n👉目前庫存：${snapAfter.box}箱${snapAfter.piece}散`,
-        },
-        { preferReply: true },
-      );
+      });
 
-      // 推送 GAS（fire-and-forget）
+      // 推送 GAS（不影響回覆速度）
       try {
         const outAmountForGas =
           (Number(result.outBox || outBox) * snapAfter.unitsPerBox + Number(result.outPiece || outPiece)) *
@@ -1045,10 +1122,12 @@ async function handleEvent(event) {
           biz_date_0500: getBizDate0500TPE(),
         };
 
-        postInventoryToGAS(payload).catch(() => {});
-      } catch {}
+        postInventoryToGAS(payload).catch((e) => console.warn('[GAS FIRE-AND-FORGET ERROR]', e?.message || e));
+      } catch (e) {
+        console.warn('[GAS PAYLOAD ERROR]', e?.message || e);
+      }
     } finally {
-      // 不主動解鎖：讓它自然 5 秒到期（你指定）
+      // lock 保留 5 秒自然過期，不主動解除（防重送/併發）
     }
 
     return;
@@ -1057,5 +1136,5 @@ async function handleEvent(event) {
 
 /* ======== Start server ======== */
 app.listen(PORT, () => {
-  console.log(`server up :${PORT} ver=${BOT_VER} db_host=${SUPA_HOST}`);
+  console.log(`伺服器已啟動：${PORT} 版本=${BOT_VER} 資料庫主機=${SUPA_HOST}`);
 });
